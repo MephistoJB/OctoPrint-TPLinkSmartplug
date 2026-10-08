@@ -182,7 +182,14 @@ $(function() {
 			sidebar_tab.removeClass('overflow_visible in').addClass('collapse').siblings('div.accordion-heading').children('a.accordion-toggle').addClass('collapsed');
 		}
 
+		self.ensureTapoFields = function(plug) {
+			if (!plug.backend) plug.backend = ko.observable('kasa');
+			if (!plug.tapoUsernameEnv) plug.tapoUsernameEnv = ko.observable('TAPO_USERNAME');
+			if (!plug.tapoPasswordEnv) plug.tapoPasswordEnv = ko.observable('TAPO_PASSWORD');
+		};
+
 		self.onBeforeBinding = function() {
+			ko.utils.arrayForEach(self.settings.settings.plugins.tplinksmartplug.arrSmartplugs(), self.ensureTapoFields);
 			self.arrSmartplugs(self.settings.settings.plugins.tplinksmartplug.arrSmartplugs());
 		}
 
@@ -220,12 +227,16 @@ $(function() {
 		}
 
 		self.editPlug = function(data) {
+			self.ensureTapoFields(data);
 			self.selectedPlug(data);
 			$("#TPLinkPlugEditor").modal("show");
 		}
 
 		self.addPlug = function() {
 			self.selectedPlug({'ip':ko.observable(''),
+								'backend':ko.observable('kasa'),
+								'tapoUsernameEnv':ko.observable('TAPO_USERNAME'),
+								'tapoPasswordEnv':ko.observable('TAPO_PASSWORD'),
 								'label':ko.observable(''),
 								'icon':ko.observable('icon-bolt'),
 								'displayWarning':ko.observable(true),
@@ -487,6 +498,11 @@ $(function() {
 		}
 
 		self.updateDictionary = function(data){
+			if (data.error) {
+				new PNotify({title: gettext("TP-Link Smartplug"), text: data.error,
+					type: "error", text_escape: true, hide: true});
+			}
+
 			ko.utils.arrayForEach(self.arrSmartplugs(),function(item){
 					if(item.ip() == data.ip) {
 						item.currentState(data.currentState);
@@ -498,6 +514,8 @@ $(function() {
 							if(data.ip == self.plotted_graph_ip() && window.location.href.indexOf('tplinksmartplug') > 0){
 								self.plotEnergyData();
 							}
+						} else if (item.backend && item.backend() === 'tapo') {
+							item.emeter.get_realtime = {};
 						}
 						self.processing.remove(data.ip);
 					}

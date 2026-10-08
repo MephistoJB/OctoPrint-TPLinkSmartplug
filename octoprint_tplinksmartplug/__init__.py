@@ -15,6 +15,7 @@ import re
 import threading
 import time
 import sqlite3
+import sys
 
 from octoprint.util.version import is_octoprint_compatible
 from uptime import uptime
@@ -81,11 +82,14 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 							octoprint.plugin.SimpleApiPlugin,
 							octoprint.plugin.StartupPlugin,
 							octoprint.plugin.ProgressPlugin,
-							octoprint.plugin.EventHandlerPlugin):
+							octoprint.plugin.EventHandlerPlugin,
+							octoprint.plugin.ShutdownPlugin):
 
 	def __init__(self):
 		self._logger = logging.getLogger("octoprint.plugins.tplinksmartplug")
 		self._tplinksmartplug_logger = logging.getLogger("octoprint.plugins.tplinksmartplug.debug")
+		self._tapo_transport = None
+		self._tapo_transport_lock = threading.Lock()
 		self.abortTimeout = 0
 		self._timeout_value = None
 		self._abort_timer = None
@@ -208,6 +212,10 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 						self._tplinksmartplug_logger.debug("powering on %s during 'Connect' failed." % (plug["ip"]))
 		return None
 
+	def on_shutdown(self):
+		if self._tapo_transport is not None:
+			self._tapo_transport.close()
+
 	##~~ SettingsPlugin mixin
 
 	def get_settings_defaults(self):
@@ -229,6 +237,8 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 		old_idleTimeoutWaitTemp = self._settings.get_int(["idleTimeoutWaitTemp"])
 
 		octoprint.plugin.SettingsPlugin.on_settings_save(self, data)
+		if self._tapo_transport is not None:
+			self._tapo_transport.reset_authentication()
 
 		self.abortTimeout = self._settings.get_int(["abortTimeout"])
 		self.powerOffWhenIdle = self._settings.get_boolean(["powerOffWhenIdle"])
@@ -267,7 +277,7 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 				self.poll_status.start()
 
 	def get_settings_version(self):
-		return 16
+		return 17
 
 	def on_settings_migrate(self, target, current=None):
 		if current is None or current < 5:
@@ -361,6 +371,14 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 				arrSmartplugs_new.append(plug)
 			self._settings.set(["arrSmartplugs"], arrSmartplugs_new)
 
+		if current is None or current < 17:
+			plugs = self._settings.get(["arrSmartplugs"])
+			for plug in plugs:
+				plug.setdefault("backend", "kasa")
+				plug.setdefault("tapoUsernameEnv", "TAPO_USERNAME")
+				plug.setdefault("tapoPasswordEnv", "TAPO_PASSWORD")
+			self._settings.set(["arrSmartplugs"], plugs)
+
 	##~~ AssetPlugin mixin
 
 	def get_assets(self):
@@ -419,6 +437,9 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 		self._tplinksmartplug_logger.debug("Turning on %s." % plugip)
 		plug = self.plug_search(self._settings.get(["arrSmartplugs"]), "ip", plugip)
 		self._tplinksmartplug_logger.debug(plug)
+		if plug.get("backend", "kasa") == "tapo" and plug.get("useCountdownRules"):
+			return dict(ip=plugip, currentState="unknown", emeter=None,
+				error="Device countdown timers are not supported for Tapo. Disable Use Timers before switching.")
 		if "/" in plugip:
 			plug_ip, plug_num = plugip.split("/")
 		else:
@@ -441,6 +462,9 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 							  *["system", "set_relay_state", "err_code"])
 
 		self._tplinksmartplug_logger.debug(chk)
+		if plug.get("backend", "kasa") == "tapo" and chk != 0:
+			return dict(ip=plugip, currentState="unknown", emeter=None,
+				error="Tapo switching failed. Check the plugin log; the command was not retried.")
 		if chk == 0:
 			if plug["autoConnect"] and self._printer.is_closed_or_error():
 				c = threading.Timer(int(plug["autoConnectDelay"]), self._printer.connect)
@@ -469,6 +493,9 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 		self._tplinksmartplug_logger.info("Turning off %s at %s" % (plugip, timenow))
 		plug = self.plug_search(self._settings.get(["arrSmartplugs"]), "ip", plugip)
 		self._tplinksmartplug_logger.debug(plug)
+		if plug.get("backend", "kasa") == "tapo" and plug.get("useCountdownRules"):
+			return dict(ip=plugip, currentState="unknown", emeter=None,
+				error="Device countdown timers are not supported for Tapo. Disable Use Timers before switching.")
 		if "/" in plugip:
 			plug_ip, plug_num = plugip.split("/")
 		else:
@@ -501,6 +528,9 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 							  *["system", "set_relay_state", "err_code"])
 
 		self._tplinksmartplug_logger.debug(chk)
+		if plug.get("backend", "kasa") == "tapo" and chk != 0:
+			return dict(ip=plugip, currentState="unknown", emeter=None,
+				error="Tapo switching failed. Check the plugin log; the command was not retried.")
 
 		return self.check_status(plugip)
 
@@ -611,7 +641,7 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 				return dict(currentState="off", emeter=emeter_data, ip=plugip)
 			else:
 				self._tplinksmartplug_logger.debug(response)
-				return dict(currentState="unknown", emeter=emeter_data, ip=plugip)
+				return dict(currentState="unknown", emeter=emeter_data, ip=plugip, error=response.get("error", ""))
 
 	def get_api_commands(self):
 		return dict(
@@ -1082,6 +1112,28 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 		return result.decode('latin-1')
 
 	def sendCommand(self, cmd, plugip, plug_num=0):
+		configured_ip = "{}/{}".format(plugip, int(plug_num)) if int(plug_num) else plugip
+		plug = self.plug_search(self._settings.get(["arrSmartplugs"]), "ip", configured_ip)
+		backend = (plug or {}).get("backend", "kasa")
+		if backend == "tapo":
+			try:
+				if sys.version_info < (3, 11):
+					raise RuntimeError("Tapo support requires Python 3.11 or newer.")
+				from .tapo_transport import TapoTransport
+				with self._tapo_transport_lock:
+					if self._tapo_transport is None:
+						self._tapo_transport = TapoTransport()
+				return self._tapo_transport.send(cmd, plug)
+			except Exception as exc:
+				# Only our own error messages are safe to expose, not third-party exceptions.
+				from .tapo_errors import safe_tapo_error
+				message = safe_tapo_error(exc, sys.version_info)
+				self._tplinksmartplug_logger.warning("Tapo request failed: %s", message)
+				return {"system": {"get_sysinfo": {"relay_state": 3}, "set_relay_state": {"err_code": -1}},
+					"emeter": {"err_code": True}, "error": message}
+		if backend != "kasa":
+			return {"system": {"get_sysinfo": {"relay_state": 3}, "set_relay_state": {"err_code": -1}},
+				"error": "Unknown plug backend. Select Kasa or Tapo."}
 		commands = {'info': '{"system":{"get_sysinfo":{}}}',
 					'on': '{"system":{"set_relay_state":{"state":1}}}',
 					'off': '{"system":{"set_relay_state":{"state":0}}}',
@@ -1273,7 +1325,7 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 				displayName="TP-Link Smartplug",
 				displayVersion=self._plugin_version,
 				type="github_release",
-				user="jneilliii",
+				user="MephistoJB",
 				repo="OctoPrint-TPLinkSmartplug",
 				current=self._plugin_version,
 				stable_branch=dict(
@@ -1286,7 +1338,7 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 						comittish=["rc", "master"],
 					)
 				],
-				pip="https://github.com/jneilliii/OctoPrint-TPLinkSmartplug/archive/{target_version}.zip"
+				pip="https://github.com/MephistoJB/OctoPrint-TPLinkSmartplug/archive/{target_version}.zip"
 			)
 		)
 

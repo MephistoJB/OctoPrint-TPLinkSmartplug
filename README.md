@@ -1,10 +1,25 @@
-# OctoPrint-TPLinkSmartplug
+# OctoPrint-TPLinkSmartplug — Tapo P110 fork
+
+This fork adds **Tapo P110 on/off and status**, including TPAP, while keeping
+legacy Kasa support. Tapo requires Python 3.11+ and account credentials supplied
+through the OctoPrint service environment. Tapo device timers and energy charts
+are not included in this first release.
+
+**[Installation, configuration and rollback](docs/TAPO.md)**
+
+Install this fork in the Plugin Manager with:
+
+```
+https://github.com/MephistoJB/OctoPrint-TPLinkSmartplug/archive/refs/heads/feature/tapo-p110-tpap.zip
+```
+
+## Original upstream documentation (Kasa)
 
 ***Warning***: Recent firmware version 1.1.0 for the HS100, HS110 have been reported to break the capability of this plugin to communicate with kasa devices. So far it seems to be only effecting UK version plugs, but could spread to other firmware variants.
 
 ***Warning***: Recent firmware updates for the HS103 breaks the use of this plugin with those devices. TP-Link may push the same firmware to other devices, but be warned that updating your devices firmware may break the use of this plugin. It appears this can be resolved by never connecting the plug to the cloud by following the steps outlined [here](https://github.com/jneilliii/OctoPrint-TPLinkSmartplug/tree/master/extras/How_to_make_Kasa_smart_devices_controlled_local_only.pdf).
 
-Work inspired by [OctoPrint-PSUControl](https://github.com/kantlivelong/OctoPrint-PSUControl) and [TP-Link WiFi SmartPlug Client](https://github.com/softScheck/tplink-smartplug), this plugin controls a TP-Link Smartplug via OctoPrint's nav bar. Currently known compatible models are the HS100, HS103, HS105, HS107, HS110, HS300, KP105, KP303, KP115. Other Kasa app based devices may work. Tapo series devices will not work with this plugin, and probably never will because of their closed communication.
+Work inspired by [OctoPrint-PSUControl](https://github.com/kantlivelong/OctoPrint-PSUControl) and [TP-Link WiFi SmartPlug Client](https://github.com/softScheck/tplink-smartplug), this plugin controls a TP-Link Smartplug via OctoPrint's nav bar. Currently known compatible models are the HS100, HS103, HS105, HS107, HS110, HS300, KP105, KP303, KP115. Other Kasa app based devices may work. The upstream version does not support Tapo. This fork adds the P110 support described above.
 
 ##  Screenshots
 ![screenshot](screenshot.png)

@@ -227,6 +227,24 @@
 	</div>
 	<div class="modal-body">
 		<table class="table table-condensed">
+            <tr>
+                <td colspan="3"><label>{{ _('Device type') }}</label>
+                    <select data-bind="value: backend">
+                        <option value="kasa">{{ _('Kasa (legacy TP-Link)') }}</option>
+                        <option value="tapo">{{ _('Tapo P110 (including TPAP)') }}</option>
+                    </select>
+                </td>
+            </tr>
+            <tr data-bind="visible: backend() === 'tapo'">
+                <td colspan="3">
+                    <p>{{ _('Tapo requires Python 3.11 or newer. Provide the Tapo account credentials to the OctoPrint service using the environment variables named below. Enter variable names here, not the email address or password.') }}</p>
+                    <label>{{ _('Account email variable') }}</label>
+                    <input type="text" class="input-block-level" autocomplete="off" data-bind="textInput: tapoUsernameEnv" />
+                    <label>{{ _('Password variable') }}</label>
+                    <input type="text" class="input-block-level" autocomplete="off" data-bind="textInput: tapoPasswordEnv" />
+                    <p>{{ _('Tapo supports on, off and status in this version. Energy charts and device countdown timers are unavailable. Disable Use Timers before switching a Tapo plug.') }}</p>
+                </td>
+            </tr>
 			<tr>
                 <td><div class="control-group" data-bind="css: {error: ip().match(/^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/[1-6])?$/) == null}"><div class="controls"><label class="control-label">{{ _('IP') }}</label><input type="text" class="input-block-level" title="{{ _('IP address of plug on network. For multiple plug devices append /1, /2, /# that corresponds to the Plug # label on the device or in the Kasa app.') }}" data-toggle="tooltip" data-bind="textInput: ip, tooltip: {container: '#TPLinkPlugEditor'}" /></div></div></td>
 				<td><div class="controls"><label class="control-label">{{ _('Icon') }}</label><input type="text" class="input-block-level" title="{{ _('Icon to use for button in navbar.') }}" data-toggle="tooltip" data-bind="value: icon, iconpicker: icon,iconpickerOptions: {hideOnSelect: true, collision: true}, tooltip: {container: '#TPLinkPlugEditor'}" /></div></td>
@@ -248,13 +266,13 @@
                 <td><div class="controls"><label class="checkbox"><input type="checkbox" title="{{ _('Automatically power on this plug when Startup Event Monitoring is enabled.') }}" data-toggle="tooltip" data-bind="checked: event_on_startup, enable: $root.settings.settings.plugins.tplinksmartplug.event_on_startup_monitoring(), tooltip: {container: '#TPLinkPlugEditor'}" disabled/> {{ _('On with Startup') }}</label></div></td>
 			</tr>
 			<tr>
-				<td><div class="controls"><label class="checkbox"><input type="checkbox" title="{{ _('When enabled the on and off commands will be sent to the plug using timers similar to the Kasa app. This is helpful for when you want to run a system command to cleanly shutdown your pi prior to power it off.') }}" data-toggle="tooltip" data-bind="checked: useCountdownRules, tooltip: {container: '#TPLinkPlugEditor'}"/> {{ _('Use Timers') }}</label></div></td>
+				<td><div class="controls"><label class="checkbox"><input type="checkbox" title="{{ _('When enabled the on and off commands will be sent to the plug using timers similar to the Kasa app. This is helpful for when you want to run a system command to cleanly shutdown your pi prior to power it off.') }}" data-toggle="tooltip" data-bind="checked: useCountdownRules, enable: backend() !== 'tapo' || useCountdownRules(), tooltip: {container: '#TPLinkPlugEditor'}"/> {{ _('Use Timers') }}</label></div></td>
 				<td></td>
 				<td><div class="controls"><label class="checkbox"><input type="checkbox" title="{{ _('Automatically power off this plug when Shutdown Event Monitoring is enabled.') }}" data-toggle="tooltip" data-bind="checked: event_on_shutdown, enable: $root.settings.settings.plugins.tplinksmartplug.event_on_shutdown_monitoring(), tooltip: {container: '#TPLinkPlugEditor'}" disabled /> {{ _('Off with Shutdown') }}</label></div></td>
 			</tr>
 			<tr>
-				<td><div class="controls"><label class="control-label">{{ _('Timer On Delay') }}</label><div class="input-append" data-toggle="tooltip" data-bind="tooltip: {container: '#TPLinkPlugEditor'}" title="{{ _('Amount of time for Timer to wait before powering on.') }}"><input type="number" min="1" data-bind="value: countdownOnDelay, enable: useCountdownRules()" class="input input-mini" disabled /><span class="add-on">{{ _('secs') }}</span></div></div></td>
-				<td><div class="controls"><label class="control-label">{{ _('Timer Off Delay') }}</label><div class="input-append" data-toggle="tooltip" data-bind="tooltip: {container: '#TPLinkPlugEditor'}" title="{{ _('Amount of time for Timer to wait before powering off.') }}"><input type="number" min="1" data-bind="value: countdownOffDelay, enable: useCountdownRules()" class="input input-mini" disabled /><span class="add-on">{{ _('secs') }}</span></div></div></td>
+				<td><div class="controls"><label class="control-label">{{ _('Timer On Delay') }}</label><div class="input-append" data-toggle="tooltip" data-bind="tooltip: {container: '#TPLinkPlugEditor'}" title="{{ _('Amount of time for Timer to wait before powering on.') }}"><input type="number" min="1" data-bind="value: countdownOnDelay, enable: useCountdownRules() && backend() !== 'tapo'" class="input input-mini" disabled /><span class="add-on">{{ _('secs') }}</span></div></div></td>
+				<td><div class="controls"><label class="control-label">{{ _('Timer Off Delay') }}</label><div class="input-append" data-toggle="tooltip" data-bind="tooltip: {container: '#TPLinkPlugEditor'}" title="{{ _('Amount of time for Timer to wait before powering off.') }}"><input type="number" min="1" data-bind="value: countdownOffDelay, enable: useCountdownRules() && backend() !== 'tapo'" class="input input-mini" disabled /><span class="add-on">{{ _('secs') }}</span></div></div></td>
 				<td></td>
 			</tr>
 			<tr>
