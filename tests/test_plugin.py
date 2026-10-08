@@ -106,7 +106,9 @@ def test_migration_preserves_existing_plug_and_automations(plugin):
     plug = {"ip": "192.0.2.5", "event_on_startup": True, "automaticShutdownEnabled": False}
     plugin._settings.get.return_value = [plug]
     plugin.on_settings_migrate(17, 16)
-    assert plugin.get_settings_version() == 17
+    assert plugin.get_settings_version() == 18
+    import uuid
+    uuid.UUID(plug.pop("tapoCredentialId"))
     assert plug == {"ip": "192.0.2.5", "event_on_startup": True, "automaticShutdownEnabled": False,
                     "backend": "kasa", "tapoUsernameEnv": "TAPO_USERNAME", "tapoPasswordEnv": "TAPO_PASSWORD"}
     assert not plugin._printer.mock_calls

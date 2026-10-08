@@ -1,6 +1,6 @@
 """Tapo P110 transport, isolated from OctoPrint and the legacy Kasa protocol.
 
-Credentials are read from the service environment, never from persisted settings.
+Credentials come from the private settings store or the service environment.
 All requests run in one worker to keep asyncio out of OctoPrint's event loop.
 """
 import asyncio
@@ -26,7 +26,7 @@ class TapoTransport:
         with self._lock:
             self._executor.shutdown(wait=True)
 
-    def send(self, command, plug):
+    def send(self, command, plug, credentials=None):
         ip = plug.get("ip", "")
         if not ip or "/" in ip:
             raise TapoError("Tapo P110 requires a host without a socket index.")
@@ -39,10 +39,14 @@ class TapoTransport:
         else:
             raise TapoError("This command is not supported for Tapo P110.")
 
-        username = os.environ.get(plug.get("tapoUsernameEnv") or "TAPO_USERNAME", "")
-        password = os.environ.get(plug.get("tapoPasswordEnv") or "TAPO_PASSWORD", "")
+        if credentials is not None:
+            username = credentials.get("username", "")
+            password = credentials.get("password", "")
+        else:
+            username = os.environ.get(plug.get("tapoUsernameEnv") or "TAPO_USERNAME", "")
+            password = os.environ.get(plug.get("tapoPasswordEnv") or "TAPO_PASSWORD", "")
         if not username or not password:
-            raise TapoError("Tapo credentials are missing from the OctoPrint service environment.")
+            raise TapoError("Tapo credentials are missing. Set the account in plugin settings or the service environment.")
 
         # Do not queue commands that could execute after their caller has timed out.
         # Serialise submission and wait for the coroutine's own bounded timeout.

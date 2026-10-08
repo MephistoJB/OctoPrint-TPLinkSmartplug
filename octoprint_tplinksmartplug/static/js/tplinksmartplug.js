@@ -184,6 +184,10 @@ $(function() {
 
 		self.ensureTapoFields = function(plug) {
 			if (!plug.backend) plug.backend = ko.observable('kasa');
+			if (!plug.tapoUsername) plug.tapoUsername = ko.observable('');
+			if (!plug.tapoPassword) plug.tapoPassword = ko.observable('');
+			if (!plug.tapoPasswordSet) plug.tapoPasswordSet = ko.observable(false);
+			if (!plug.tapoClearCredentials) plug.tapoClearCredentials = ko.observable(false);
 			if (!plug.tapoUsernameEnv) plug.tapoUsernameEnv = ko.observable('TAPO_USERNAME');
 			if (!plug.tapoPasswordEnv) plug.tapoPasswordEnv = ko.observable('TAPO_PASSWORD');
 		};
@@ -192,6 +196,24 @@ $(function() {
 			ko.utils.arrayForEach(self.settings.settings.plugins.tplinksmartplug.arrSmartplugs(), self.ensureTapoFields);
 			self.arrSmartplugs(self.settings.settings.plugins.tplinksmartplug.arrSmartplugs());
 		}
+
+		self.onSettingsShown = function() {
+			ko.utils.arrayForEach(self.settings.settings.plugins.tplinksmartplug.arrSmartplugs(), self.ensureTapoFields);
+			self.arrSmartplugs(self.settings.settings.plugins.tplinksmartplug.arrSmartplugs());
+		};
+
+		self.onSettingsHidden = function() {
+			ko.utils.arrayForEach(self.arrSmartplugs(), function(plug) {
+				if (plug.tapoPassword) plug.tapoPassword('');
+			});
+			if (self.selectedPlug() && self.selectedPlug().tapoPassword) self.selectedPlug().tapoPassword('');
+		};
+
+		self.publicPlugs = function() {
+			var plugs = ko.toJS(self.arrSmartplugs);
+			ko.utils.arrayForEach(plugs, function(plug) { delete plug.tapoPassword; });
+			return plugs;
+		};
 
 		self.onAfterBinding = function() {
 			self.plotted_graph_ip.subscribe(self.plotEnergyData, self);
@@ -235,6 +257,10 @@ $(function() {
 		self.addPlug = function() {
 			self.selectedPlug({'ip':ko.observable(''),
 								'backend':ko.observable('kasa'),
+								'tapoUsername':ko.observable(''),
+								'tapoPassword':ko.observable(''),
+								'tapoPasswordSet':ko.observable(false),
+								'tapoClearCredentials':ko.observable(false),
 								'tapoUsernameEnv':ko.observable('TAPO_USERNAME'),
 								'tapoPasswordEnv':ko.observable('TAPO_PASSWORD'),
 								'label':ko.observable(''),
@@ -521,7 +547,7 @@ $(function() {
 					}
 				});
 				//self.dictSmartplugs.removeAll();
-				self.dictSmartplugs.pushAll(ko.toJS(self.arrSmartplugs),'ip');
+				self.dictSmartplugs.pushAll(self.publicPlugs(),'ip');
 			}
 
 		self.checkStatus = function(plugIP) {

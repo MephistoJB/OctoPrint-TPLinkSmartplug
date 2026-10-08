@@ -171,3 +171,16 @@ def test_concurrent_calls_are_serialized(transport, plug):
 def test_installed_tapo_library_has_expected_api():
     from tapo import ApiClient
     assert callable(ApiClient.p110)
+
+
+def test_saved_credentials_override_environment(transport, plug):
+    adapter, _, factory = transport
+    adapter.send(STATUS, plug, credentials={"username": "saved@example.invalid", "password": "saved-test-password"})
+    factory.assert_called_once_with("saved@example.invalid", "saved-test-password")
+
+
+def test_incomplete_saved_account_does_not_silently_use_environment(transport, plug):
+    adapter, _, factory = transport
+    with pytest.raises(TapoError, match="credentials are missing"):
+        adapter.send(STATUS, plug, credentials={"username": "saved@example.invalid"})
+    factory.assert_not_called()

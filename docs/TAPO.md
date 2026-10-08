@@ -13,7 +13,7 @@ https://github.com/MephistoJB/OctoPrint-TPLinkSmartplug/archive/refs/heads/featu
 ```
 
 The identifier is unchanged, so this replaces the original plugin rather than
-adding a second controller. Its version is `1.1.0rc1`. Updates point to this fork
+adding a second controller. Its version is `1.1.0rc2`. Updates point to this fork
 so an upstream update cannot remove Tapo support. Plugin installation/activation
 normally requires an OctoPrint restart; development and tests do not.
 
@@ -22,18 +22,25 @@ normally requires an OctoPrint restart; development and tests do not.
 1. The Python interpreter running **OctoPrint** must be **3.11+**. An upgraded
    system Python alone is not enough. `tapo==0.11.1` is installed automatically on
    supported Python versions. Kasa support remains available on older Python.
-2. Supply the Tapo account email and password to the OctoPrint **process
-   environment**, as `TAPO_USERNAME` and `TAPO_PASSWORD`. Use the host's existing
-   secret-management mechanism. The plugin does not save credentials in settings,
-   send them to the browser, or log them. Do not put passwords in committed
-   configuration or shell commands.
-3. In Settings → TP-Link Smartplug, edit/add a plug, select **Tapo P110** and enter
-   its IP or hostname without a `/1` socket suffix. The account variable fields
-   contain **environment variable names**, never the actual email/password.
-   Custom names can select different accounts for different plugs.
-4. Disable **Use Timers** and save the main settings. Check status first, then
-   test on/off while idle. Review Auto Connect/Disconnect, GCODE, startup and
-   automatic shutdown options before enabling them.
+2. In Settings → TP-Link Smartplug, edit/add a plug, select **Tapo P110** and
+   enter its IP or hostname without a `/1` socket suffix.
+3. Administrators can enter the **Tapo account email and password** directly in
+   the plug editor. Save the main settings. Credentials persist in the OctoPrint
+   configuration on the host; the plugin does not encrypt this local store.
+   The password is never returned by the settings or plug-list API and is never
+   written to plugin logs. The browser receives only the account email and a
+   "Password saved" indicator. An empty password field preserves the saved
+   password. Changing the account email requires entering its password again.
+4. To remove a stored account, select **Remove stored account credentials** and
+   save. Removing a plug also removes its private credentials. IP address changes
+   keep the saved account, using an internal identifier rather than the address.
+5. Environment-based setup remains available under **Advanced**. If no account
+   is stored, the plugin reads the variables named there, defaulting to
+   `TAPO_USERNAME` and `TAPO_PASSWORD`. Saved credentials take priority; the two
+   sources are not mixed. Removing the saved account restores environment mode.
+6. Disable **Use Timers**. Check status first, then test on/off while idle. Review
+   Auto Connect/Disconnect, GCODE, startup and automatic shutdown options before
+   enabling them.
 
 ## Supported functions and limitations
 
@@ -50,7 +57,8 @@ normally requires an OctoPrint restart; development and tests do not.
   credentials change or settings are saved. Correct the account, or wait for a
   device login lock to expire, before saving/retrying.
 - Library exception details are never logged or sent to the browser; errors are
-  fixed diagnostic messages. Credentials remain only in process memory.
+  fixed diagnostic messages. New passwords are cleared from the browser model
+  when the settings dialog closes and are omitted from navbar plug data.
 - Commands go to the local plug IP, with no cloud API used for switching. Login
   still requires the existing Tapo account credentials.
 

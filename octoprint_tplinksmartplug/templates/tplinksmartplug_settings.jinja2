@@ -235,14 +235,24 @@
                     </select>
                 </td>
             </tr>
-            <tr data-bind="visible: backend() === 'tapo'">
+            <tr data-bind="visible: backend() === 'tapo' && $root.loginState.isAdmin()">
                 <td colspan="3">
-                    <p>{{ _('Tapo requires Python 3.11 or newer. Provide the Tapo account credentials to the OctoPrint service using the environment variables named below. Enter variable names here, not the email address or password.') }}</p>
-                    <label>{{ _('Account email variable') }}</label>
-                    <input type="text" class="input-block-level" autocomplete="off" data-bind="textInput: tapoUsernameEnv" />
-                    <label>{{ _('Password variable') }}</label>
-                    <input type="text" class="input-block-level" autocomplete="off" data-bind="textInput: tapoPasswordEnv" />
-                    <p>{{ _('Tapo supports on, off and status in this version. Energy charts and device countdown timers are unavailable. Disable Use Timers before switching a Tapo plug.') }}</p>
+                    <label>{{ _('Tapo account email') }}</label>
+                    <input type="email" class="input-block-level" autocomplete="username" data-bind="textInput: tapoUsername, enable: !tapoClearCredentials()" />
+                    <label>{{ _('Tapo password') }}</label>
+                    <input type="password" class="input-block-level" autocomplete="new-password" data-bind="textInput: tapoPassword, enable: !tapoClearCredentials()" />
+                    <p data-bind="visible: tapoPasswordSet">{{ _('Password saved. Leave the password field empty to keep it unchanged.') }}</p>
+                    <p>{{ _('A new password is stored on the OctoPrint host and is never returned to the browser. Changing the account email requires entering its password again.') }}</p>
+                    <label class="checkbox"><input type="checkbox" data-bind="checked: tapoClearCredentials" /> {{ _('Remove stored account credentials (use environment settings instead)') }}</label>
+                    <details>
+                        <summary>{{ _('Advanced: account from environment variables') }}</summary>
+                        <p>{{ _('Used only when no account is stored above. Enter variable names, not credential values.') }}</p>
+                        <label>{{ _('Account email variable') }}</label>
+                        <input type="text" class="input-block-level" autocomplete="off" data-bind="textInput: tapoUsernameEnv" />
+                        <label>{{ _('Password variable') }}</label>
+                        <input type="text" class="input-block-level" autocomplete="off" data-bind="textInput: tapoPasswordEnv" />
+                    </details>
+                    <p>{{ _('Tapo requires Python 3.11 or newer. Energy charts and device countdown timers are unavailable. Disable Use Timers before switching a Tapo plug.') }}</p>
                 </td>
             </tr>
 			<tr>

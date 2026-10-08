@@ -16,6 +16,7 @@ import threading
 import time
 import sqlite3
 import sys
+import uuid
 
 from octoprint.util.version import is_octoprint_compatible
 from uptime import uptime
@@ -219,7 +220,7 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 	##~~ SettingsPlugin mixin
 
 	def get_settings_defaults(self):
-		return {'debug_logging': False, 'arrSmartplugs': [], 'pollingInterval': 15, 'pollingEnabled': False,
+		return {'tapoCredentials': {}, 'debug_logging': False, 'arrSmartplugs': [], 'pollingInterval': 15, 'pollingEnabled': False,
 				'thermal_runaway_monitoring': False, 'thermal_runaway_max_bed': 0, 'thermal_runaway_max_extruder': 0,
 				'event_on_error_monitoring': False, 'event_on_disconnect_monitoring': False,
 				'event_on_upload_monitoring': False, 'event_on_upload_monitoring_always': False,
@@ -227,7 +228,21 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 				'abortTimeout': 30, 'powerOffWhenIdle': False, 'idleTimeout': 30, 'idleIgnoreCommands': 'M105',
 				'idleIgnoreHeaters': '', 'idleTimeoutWaitTemp': 50, 'progress_polling': False, 'useDropDown': False}
 
+	def get_settings_restricted_paths(self):
+		return {"never": [["tapoCredentials"]]}
+
+	def on_settings_load(self):
+		from .tapo_credentials import public_plugs
+		data = octoprint.plugin.SettingsPlugin.on_settings_load(self)
+		data.pop("tapoCredentials", None)
+		data["arrSmartplugs"] = public_plugs(data.get("arrSmartplugs", []),
+			self._settings.get(["tapoCredentials"]) or {}, Permissions.ADMIN.can())
+		return data
+
 	def on_settings_save(self, data):
+		from .tapo_credentials import prepare_settings
+		data, credentials = prepare_settings(data, self._settings.get(["arrSmartplugs"]) or [],
+			self._settings.get(["tapoCredentials"]) or {}, Permissions.ADMIN.can())
 		old_debug_logging = self._settings.get_boolean(["debug_logging"])
 		old_polling_value = self._settings.get_boolean(["pollingEnabled"])
 		old_polling_timer = self._settings.get(["pollingInterval"])
@@ -237,6 +252,7 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 		old_idleTimeoutWaitTemp = self._settings.get_int(["idleTimeoutWaitTemp"])
 
 		octoprint.plugin.SettingsPlugin.on_settings_save(self, data)
+		self._settings.set(["tapoCredentials"], credentials)
 		if self._tapo_transport is not None:
 			self._tapo_transport.reset_authentication()
 
@@ -277,7 +293,7 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 				self.poll_status.start()
 
 	def get_settings_version(self):
-		return 17
+		return 18
 
 	def on_settings_migrate(self, target, current=None):
 		if current is None or current < 5:
@@ -377,6 +393,12 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 				plug.setdefault("backend", "kasa")
 				plug.setdefault("tapoUsernameEnv", "TAPO_USERNAME")
 				plug.setdefault("tapoPasswordEnv", "TAPO_PASSWORD")
+			self._settings.set(["arrSmartplugs"], plugs)
+
+		if current is None or current < 18:
+			plugs = self._settings.get(["arrSmartplugs"])
+			for plug in plugs:
+				plug.setdefault("tapoCredentialId", str(uuid.uuid4()))
 			self._settings.set(["arrSmartplugs"], plugs)
 
 	##~~ AssetPlugin mixin
@@ -710,7 +732,8 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 			self._tplinksmartplug_logger.debug("Restarting idle timer.")
 			self._reset_idle_timer()
 		elif command == "getListPlug":
-			return json.dumps(self._settings.get(["arrSmartplugs"]))
+			from .tapo_credentials import public_plugs
+			return json.dumps(public_plugs(self._settings.get(["arrSmartplugs"]), {}))
 		else:
 			response = dict(ip="{ip}".format(**data), currentState="unknown")
 		if command == "enableAutomaticShutdown" or command == "disableAutomaticShutdown":
@@ -1123,6 +1146,10 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 				with self._tapo_transport_lock:
 					if self._tapo_transport is None:
 						self._tapo_transport = TapoTransport()
+				accounts = self._settings.get(["tapoCredentials"]) or {}
+				account = accounts.get(plug.get("tapoCredentialId")) if isinstance(accounts, dict) else None
+				if account is not None:
+					return self._tapo_transport.send(cmd, plug, credentials=account)
 				return self._tapo_transport.send(cmd, plug)
 			except Exception as exc:
 				# Only our own error messages are safe to expose, not third-party exceptions.

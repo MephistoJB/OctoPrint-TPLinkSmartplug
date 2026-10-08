@@ -1,8 +1,8 @@
 # OctoPrint-TPLinkSmartplug — Tapo P110 fork
 
 This fork adds **Tapo P110 on/off and status**, including TPAP, while keeping
-legacy Kasa support. Tapo requires Python 3.11+ and account credentials supplied
-through the OctoPrint service environment. Tapo device timers and energy charts
+legacy Kasa support. Tapo requires Python 3.11+. Administrators can configure the account email
+and password in the plug editor; environment-based credentials remain available. Tapo device timers and energy charts
 are not included in this first release.
 
 **[Installation, configuration and rollback](docs/TAPO.md)**
