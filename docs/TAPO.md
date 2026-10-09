@@ -13,7 +13,7 @@ https://github.com/MephistoJB/OctoPrint-TPLinkSmartplug/archive/refs/heads/featu
 ```
 
 The identifier is unchanged, so this replaces the original plugin rather than
-adding a second controller. Its version is `1.1.0rc2`. Updates point to this fork
+adding a second controller. Its version is `1.1.0rc3`. Updates point to this fork
 so an upstream update cannot remove Tapo support. Plugin installation/activation
 normally requires an OctoPrint restart; development and tests do not.
 
@@ -78,3 +78,5 @@ no network requests and need no real credentials.
 Back up your OctoPrint configuration. Reinstall the upstream plugin with its
 original Plugin Manager URL, and restart OctoPrint while idle. The upstream
 version cannot operate Tapo plugs; do not change their type to Kasa.
+
+The TP-Link Smartplug sidebar lists every configured plug, including Tapo plugs without energy readings. Use On and Off there to switch the relay; Off retains the configured confirmation dialog. Status updates after switching and through the refresh icon. Controls require the plugin control permission and are disabled while a request is pending.

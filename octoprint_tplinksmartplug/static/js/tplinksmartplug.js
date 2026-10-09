@@ -11,6 +11,7 @@ $(function() {
 		self.settings = parameters[0];
 		self.loginState = parameters[1];
 		self.filesViewModel = parameters[2];
+        self.access = parameters[3];
 
         // Hijack the getAdditionalData function and add the custom data
         let oldGetData = self.filesViewModel.getAdditionalData;
@@ -345,6 +346,37 @@ $(function() {
 			}
 		};
 
+        self.plugStateText = function(data) {
+            if (self.processing().indexOf(data.ip()) !== -1) return gettext("Working...");
+            if (data.currentState() === "on") return gettext("On");
+            if (data.currentState() === "off") return gettext("Off");
+            return gettext("Unknown");
+        };
+
+        self.canControlPlug = function(data) {
+            return self.loginState.hasPermission(self.access.permissions.PLUGIN_TPLINKSMARTPLUG_CONTROL) &&
+                self.processing().indexOf(data.ip()) === -1;
+        };
+
+        self.sidebarTurnOn = function(data) {
+            if (!self.canControlPlug(data)) return;
+            self.processing.push(data.ip());
+            self.turnOn(data);
+        };
+
+        self.sidebarTurnOff = function(data) {
+            if (!self.canControlPlug(data)) return;
+            self.processing.push(data.ip());
+            self.turnOff(data);
+        };
+
+        self.requestFailed = function(ip) {
+            self.processing.remove(ip);
+            new PNotify({title: gettext("TP-Link Smartplug"),
+                text: gettext("The plug request failed. Refresh its status before trying again."),
+                type: "error", text_escape: true, hide: true});
+        };
+
 		self.toggleRelay = function(data) {
 			self.processing.push(data.ip());
 			switch(data.currentState()){
@@ -364,6 +396,7 @@ $(function() {
 		}
 
 		self.sendTurnOn = function(data) {
+            var argumentsPlug = data;
 			$.ajax({
 				url: API_BASEURL + "plugin/tplinksmartplug",
 				type: "POST",
@@ -376,7 +409,7 @@ $(function() {
 			}).done(function(data){
 					self.updateDictionary(data);
 					self.processing.remove(data.ip);
-				});
+				}).fail(function() { self.requestFailed(ko.toJS(argumentsPlug.ip)); });
 		};
 
 		self.turnOff = function(data) {
@@ -390,6 +423,7 @@ $(function() {
 		};
 
 		self.sendTurnOff = function(data) {
+            var argumentsPlug = data;
 			$.ajax({
 			url: API_BASEURL + "plugin/tplinksmartplug",
 			type: "POST",
@@ -402,7 +436,7 @@ $(function() {
 			}).done(function(data){
 					self.updateDictionary(data);
 					self.processing.remove(data.ip);
-				});
+				}).fail(function() { self.requestFailed(ko.toJS(argumentsPlug.ip)); });
 		}
 
 		self.plotEnergyData = function(data) {
@@ -557,7 +591,7 @@ $(function() {
 				dataType: "json",
 				data: {checkStatus:plugIP},
 				contentType: "application/json; charset=UTF-8"
-			}).done(self.updateDictionary);
+			}).done(self.updateDictionary).fail(function() { self.requestFailed(plugIP); });
 		};
 
 		self.checkStatuses = function() {
@@ -572,7 +606,7 @@ $(function() {
 
 	OCTOPRINT_VIEWMODELS.push([
 		tplinksmartplugViewModel,
-		["settingsViewModel","loginStateViewModel", "filesViewModel"],
+		["settingsViewModel","loginStateViewModel", "filesViewModel", "accessViewModel"],
 		["#navbar_plugin_tplinksmartplug","#settings_plugin_tplinksmartplug","#sidebar_plugin_tplinksmartplug_wrapper","#tab_plugin_tplinksmartplug","#tab_plugin_tplinksmartplug_link"]
 	]);
 });

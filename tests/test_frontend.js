@@ -19,11 +19,21 @@ function plain(value) {
     if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, plain(v)]));
     return value;
 }
-function jquery(arg) { if (typeof arg === 'function') arg(); return {modal() {}}; }
+let warningVisible = false;
+let request;
+function jquery(arg) {
+    if (typeof arg === 'function') arg();
+    return {modal(action) { warningVisible = action === 'show'; }, is() { return warningVisible; }};
+}
+jquery.ajax = options => {
+    request = {options};
+    const chain = {done(fn) { request.done = fn; return chain; }, fail(fn) { request.fail = fn; return chain; }};
+    return chain;
+};
 function notify() {}
 notify.prototype.options = {confirm: {buttons: []}};
 const context = {
-    $: jquery, PNotify: notify, gettext: x => x, OCTOPRINT_VIEWMODELS: [],
+    API_BASEURL: '/api/', $: jquery, PNotify: notify, gettext: x => x, OCTOPRINT_VIEWMODELS: [],
     ko: {
         observable, observableArray: array, computed: fn => fn, pureComputed: fn => fn,
         observableDictionary: () => ({items: array(), pushAll() {}}),
@@ -58,3 +68,41 @@ assert.equal(model.selectedPlug().tapoUsername(), '');
 assert.equal(model.selectedPlug().tapoPassword(), '');
 assert.equal(model.selectedPlug().tapoClearCredentials(), false);
 console.log('Frontend credential lifecycle passed');
+
+warningVisible = false;
+const relay = {
+    ip: observable('192.0.2.2'), label: observable('Printer plug'),
+    currentState: observable('unknown'), emeter: {get_realtime: {}},
+    backend: observable('tapo'), displayWarning: observable(true), warnPrinting: observable(true)
+};
+model.arrSmartplugs([relay]);
+let permitted = true;
+const permission = [{method: 'role', value: ['plugin_tplinksmartplug_control']}];
+model.access = {permissions: {PLUGIN_TPLINKSMARTPLUG_CONTROL: permission}};
+model.loginState.hasPermission = key => permitted && key === permission;
+assert.equal(model.plugStateText(relay), 'Unknown');
+model.sidebarTurnOn(relay);
+assert.equal(JSON.parse(request.options.data).command, 'turnOn', 'unknown Tapo state must still allow switching on');
+assert.equal(model.canControlPlug(relay), false, 'pending requests must disable controls');
+assert.equal(model.plugStateText(relay), 'Working...');
+request.done({ip: relay.ip(), currentState: 'on', emeter: null});
+assert.equal(model.plugStateText(relay), 'On');
+assert.equal(model.canControlPlug(relay), true);
+const previous = request;
+model.sidebarTurnOff(relay);
+assert.equal(warningVisible, true, 'sidebar off must preserve confirmation');
+assert.equal(request, previous, 'no off request before confirmation');
+model.cancelClick(relay);
+warningVisible = false;
+assert.equal(model.canControlPlug(relay), true, 'cancel must restore controls');
+model.sidebarTurnOff(relay);
+model.turnOff(relay);
+assert.equal(JSON.parse(request.options.data).command, 'turnOff');
+request.fail();
+assert.equal(model.canControlPlug(relay), true, 'HTTP errors must not leave the plug busy');
+assert.equal(relay.currentState(), 'on', 'failed writes must not invent a new relay state');
+permitted = false;
+const deniedRequest = request;
+model.sidebarTurnOn(relay);
+assert.equal(request, deniedRequest, 'users without control permission cannot switch');
+console.log('Sidebar relay controls passed');
