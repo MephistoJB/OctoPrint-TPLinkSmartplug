@@ -75,8 +75,11 @@ Energy graphs remain available for devices that supply data through python-kasa.
 Device countdown timers are unavailable in 2.0. Other Tapo models and TPAP strip
 socket indices are outside this adapter's scope.
 
-TPAP requests are serialized, with a 10-second operation timeout. Concurrent
-writes are rejected rather than queued for later execution. Failed TPAP writes
+TPAP requests are serialized, with a 10-second operation timeout. The 2.0 adapter serializes
+status and switching requests through a cancellation-aware async gate, so a
+concurrent poll cannot suppress automatic power-off. A cancelled queued write
+is removed before it is submitted to a thread. Direct concurrent writes outside
+that gate are rejected. Failed TPAP writes
 are not retried. Authentication failures block further requests for that account
 until credentials change or settings are saved. A failed write is reported as
 unknown instead of being hidden by a later successful status read. A timed-out

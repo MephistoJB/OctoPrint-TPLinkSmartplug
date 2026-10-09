@@ -897,13 +897,9 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 			self._idleTimer = None
 
 	def _reset_idle_timer(self):
-		try:
-			if self._idleTimer.is_alive():
-				self._idleTimer.reset()
-			else:
-				raise Exception()
-		except Exception as e:
-			self._tplinksmartplug_logger.error(f"idle timer exception: {e}")
+		if self._idleTimer is not None and self._idleTimer.is_alive():
+			self._idleTimer.reset(interval=self.idleTimeout * 60)
+		else:
 			self._start_idle_timer()
 
 	def _idle_poweroff(self):

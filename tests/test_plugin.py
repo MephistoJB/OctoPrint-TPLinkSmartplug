@@ -188,3 +188,22 @@ def test_discovered_device_update_does_not_log_account_exception(plugin,caplog):
     device=Mock();device.update=AsyncMock(side_effect=RuntimeError('private-session-password'))
     plugin._run_device_task(plugin.update_device(device))
     assert 'private-session-password' not in caplog.text
+
+
+def test_idle_timeout_changes_update_existing_timer_interval(plugin):
+    plugin._idleTimer=Mock()
+    plugin._idleTimer.is_alive.return_value=True
+    plugin.idleTimeout=1
+    plugin._reset_idle_timer()
+    plugin._idleTimer.reset.assert_called_with(interval=60)
+    plugin.idleTimeout=30
+    plugin._reset_idle_timer()
+    plugin._idleTimer.reset.assert_called_with(interval=1800)
+
+
+def test_idle_timer_initialization_is_not_logged_as_an_error(plugin,caplog):
+    plugin._idleTimer=None
+    with patch.object(plugin,'_start_idle_timer') as start:
+        plugin._reset_idle_timer()
+    start.assert_called_once()
+    assert 'idle timer exception' not in caplog.text
