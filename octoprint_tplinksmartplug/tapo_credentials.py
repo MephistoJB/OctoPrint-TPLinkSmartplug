@@ -55,3 +55,31 @@ def prepare_settings(data, current_plugs, credentials, admin):
     # Removing a plug also removes its otherwise orphaned account credentials.
     accounts = {key: value for key, value in accounts.items() if key in used_ids}
     return clean, accounts
+
+
+def prepare_default_account(data, username, password, admin):
+    """Keep the upstream default account write-only, with explicit removal."""
+    clean = copy.deepcopy(data)
+    clear = clean.pop("clearDefaultCredentials", False)
+    clean.pop("passwordSet", None)
+    if not any(key in clean for key in ("username", "password")) and not clear:
+        return clean
+    new_username = clean.get("username", username)
+    new_password = clean.get("password", "")
+    if not admin:
+        raise PermissionError("Only administrators can configure TP-Link credentials.")
+    if not isinstance(new_username, str) or not isinstance(new_password, str):
+        raise ValueError("Account email and password must be text.")
+    new_username = new_username.strip()
+    if clear:
+        clean.update(username="", password="")
+    elif new_password:
+        if not new_username:
+            raise ValueError("Enter the account email before saving a new password.")
+        clean.update(username=new_username, password=new_password)
+    elif new_username != username:
+        raise ValueError("Enter a new password when changing the account email, or explicitly remove the stored credentials.")
+    else:
+        clean["username"] = username
+        clean.pop("password", None)
+    return clean

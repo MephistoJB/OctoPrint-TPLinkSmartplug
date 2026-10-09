@@ -33,7 +33,7 @@ jquery.ajax = options => {
 function notify() {}
 notify.prototype.options = {confirm: {buttons: []}};
 const context = {
-    API_BASEURL: '/api/', $: jquery, PNotify: notify, gettext: x => x, OCTOPRINT_VIEWMODELS: [],
+    API_BASEURL: '/api/', moment: () => ({subtract() { return this; }, format() { return '2026-10-09T12:00'; }}), $: jquery, PNotify: notify, gettext: x => x, OCTOPRINT_VIEWMODELS: [],
     ko: {
         observable, observableArray: array, computed: fn => fn, pureComputed: fn => fn,
         observableDictionary: () => ({items: array(), pushAll() {}}),
@@ -106,3 +106,13 @@ const deniedRequest = request;
 model.sidebarTurnOn(relay);
 assert.equal(request, deniedRequest, 'users without control permission cannot switch');
 console.log('Sidebar relay controls passed');
+
+settings.settings.plugins.tplinksmartplug.password = observable('dummy-default-password');
+model.onSettingsHidden();
+assert.equal(settings.settings.plugins.tplinksmartplug.password(), '', 'closing settings must clear the new default-account password input');
+model.add_discovered_device('192.0.2.3', 'Discovered plug');
+model.editPlug(model.selectedPlug());
+assert.equal(model.selectedPlug().backend(), 'kasa', 'discovered devices should use upstream python-kasa');
+assert.equal(model.selectedPlug().tapoPassword(), '');
+assert.equal(model.selectedPlug().useCountdownRules(), false);
+console.log('2.0 default account and discovered-device editor passed');

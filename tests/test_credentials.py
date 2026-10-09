@@ -150,7 +150,8 @@ def test_private_credentials_are_only_passed_to_transport(persisted_plugin):
     p, _, _, _ = persisted_plugin
     p._settings.set(["tapoCredentials"], copy.deepcopy(ACCOUNT))
     p._tapo_transport = Mock()
-    p.sendCommand({"system": {"get_sysinfo": {}}}, PLUG["ip"])
+    p._tapo_transport.send.return_value = {"system": {"get_sysinfo": {"relay_state": 1}}}
+    p.get_device(PLUG["ip"])
     p._tapo_transport.send.assert_called_once_with({"system": {"get_sysinfo": {}}}, PLUG, credentials=ACCOUNT[CID])
 
 
@@ -174,3 +175,50 @@ def test_real_non_admin_settings_response_has_no_account_details(persisted_plugi
     assert "tapoUsername" not in response["arrSmartplugs"][0]
     assert "tapoPasswordSet" not in response["arrSmartplugs"][0]
     assert PASSWORD not in json.dumps(response)
+
+
+def test_default_account_blank_password_preserves_saved_value():
+    from octoprint_tplinksmartplug.tapo_credentials import prepare_default_account
+    clean = prepare_default_account({'username':'test@example.invalid','password':'','passwordSet':True},'test@example.invalid',PASSWORD,True)
+    assert 'password' not in clean
+    assert 'passwordSet' not in clean
+    assert clean['username']=='test@example.invalid'
+
+
+def test_default_account_replacement_and_explicit_removal():
+    from octoprint_tplinksmartplug.tapo_credentials import prepare_default_account
+    assert prepare_default_account({'username':'other@example.invalid','password':'new-dummy'},'test@example.invalid',PASSWORD,True)['password']=='new-dummy'
+    assert prepare_default_account({'clearDefaultCredentials':True},'test@example.invalid',PASSWORD,True)=={'username':'','password':''}
+    with pytest.raises(ValueError):
+        prepare_default_account({'username':'other@example.invalid','password':''},'test@example.invalid',PASSWORD,True)
+    with pytest.raises(PermissionError):
+        prepare_default_account({'password':'new-dummy'},'test@example.invalid',PASSWORD,False)
+
+
+def test_real_upstream_default_password_and_device_configs_are_write_only(persisted_plugin):
+    p, settings, config, basedir = persisted_plugin
+    p._settings.set(['username'],'test@example.invalid')
+    p._settings.set(['password'],PASSWORD)
+    p._settings.set(['device_configs'],{'192.0.2.1':{'credentials_hash':'dummy-authentication-hash'}})
+    with patch('octoprint_tplinksmartplug.Permissions.ADMIN.can',return_value=True):
+        response = p.on_settings_load()
+        assert response['password']==''
+        assert response['passwordSet'] is True
+        assert 'device_configs' not in response
+        assert PASSWORD not in json.dumps(response)
+        p.on_settings_save({'username':'test@example.invalid','password':''})
+        assert p._settings.get(['password'])==PASSWORD
+        p.on_settings_save({'username':'test@example.invalid','password':'','clearDefaultCredentials':True})
+        assert p._settings.get(['password'])==''
+        assert p._settings.get(['username'])==''
+    with patch('octoprint_tplinksmartplug.Permissions.ADMIN.can',return_value=False):
+        response = p.on_settings_load()
+        assert response['username']==''
+        assert response['passwordSet'] is False
+
+
+def test_api_cannot_inject_credential_bearing_device_configs(persisted_plugin):
+    p, _, _, _ = persisted_plugin
+    with patch('octoprint_tplinksmartplug.Permissions.ADMIN.can',return_value=True):
+        p.on_settings_save({'device_configs':{'192.0.2.1':{'credentials':{'password':'injected'}}}})
+    assert p._settings.get(['device_configs'])=={}

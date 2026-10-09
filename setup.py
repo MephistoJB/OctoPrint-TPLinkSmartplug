@@ -14,11 +14,11 @@ plugin_package = "octoprint_tplinksmartplug"
 plugin_name = "OctoPrint-TPLinkSmartplug"
 
 # The plugin's version. Can be overwritten within OctoPrint's internal data via __plugin_version__ in the plugin module
-plugin_version = "1.1.0rc3"
+plugin_version = "2.0.0rc9"
 
 # The plugin's description. Can be overwritten within OctoPrint's internal data via __plugin_description__ in the plugin
 # module
-plugin_description = """Control legacy Kasa and Tapo P110 smart plugs (TPAP support)"""
+plugin_description = """TP-Link 2.0 with migrated settings and Tapo P110 TPAP support. Simple plugin to control TP-Link Smartplug"""
 
 # The plugin's author. Can be overwritten within OctoPrint's internal data via __plugin_author__ in the plugin module
 plugin_author = "jneilliii"
@@ -33,7 +33,7 @@ plugin_url = "https://github.com/MephistoJB/OctoPrint-TPLinkSmartplug"
 plugin_license = "AGPLv3"
 
 # Any additional requirements besides OctoPrint should be listed here
-plugin_requires = ["uptime", 'tapo==0.11.1; python_version >= "3.11"']
+plugin_requires = ["uptime", "python-kasa>=0.11.0.1,<0.12", "tapo==0.11.1"]
 
 ### --------------------------------------------------------------------------------------------------------------------
 ### More advanced options that you usually shouldn't have to touch follow after this point

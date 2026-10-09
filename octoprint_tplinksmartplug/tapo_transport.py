@@ -1,4 +1,4 @@
-"""Tapo P110 transport, isolated from OctoPrint and the legacy Kasa protocol.
+"""Tapo P110 transport, used only for firmware unsupported by python-kasa.
 
 Credentials come from the private settings store or the service environment.
 All requests run in one worker to keep asyncio out of OctoPrint's event loop.
@@ -7,6 +7,7 @@ import asyncio
 import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 
 
 class TapoError(Exception):
@@ -50,7 +51,7 @@ class TapoTransport:
 
         # Do not queue commands that could execute after their caller has timed out.
         # Serialise submission and wait for the coroutine's own bounded timeout.
-        with self._lock:
+        with self._request_lock(action):
             credentials = (username, password)
             if self._blocked.get(ip) == credentials:
                 raise TapoError("Tapo login is blocked after an authentication failure. Check credentials and save settings before retrying.")
@@ -60,6 +61,17 @@ class TapoTransport:
                 if str(exc) == "Tapo authentication failed. Check the account credentials or device login lock.":
                     self._blocked[ip] = credentials
                 raise
+
+    @contextmanager
+    def _request_lock(self, action):
+        # A cancelled asynchronous caller cannot cancel a thread already waiting
+        # for this lock. Never queue a write that could run after that cancellation.
+        if not self._lock.acquire(blocking=action == "status"):
+            raise TapoError("Another Tapo request is in progress. The switching command was not sent; refresh the plug status before retrying.")
+        try:
+            yield
+        finally:
+            self._lock.release()
 
     def reset_authentication(self):
         with self._lock:
@@ -75,7 +87,7 @@ class TapoTransport:
         except Exception as exc:
             # Native library errors may contain request details; never log or expose them.
             description = str(exc).upper()
-            if any(word in description for word in ("UNAUTHORIZED", "CREDENTIAL", "AUTH", "PASSWORD", "LOGIN")):
+            if any(word in description for word in ("UNAUTHORIZED", "CREDENTIAL", "AUTH", "PASSWORD", "LOGIN", "TPAP_HASH_MISMATCH")):
                 raise TapoError("Tapo authentication failed. Check the account credentials or device login lock.") from None
             raise TapoError("Tapo communication failed. Check reachability and credentials; the command was not retried.") from None
 

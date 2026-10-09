@@ -116,9 +116,10 @@ def test_authentication_failure_blocks_polling_without_exposing_secrets(transpor
     adapter.reset_authentication()
 
 
-def test_settings_retry_clears_authentication_block(transport, plug):
+@pytest.mark.parametrize("failure", ["Unauthorized", "TPAP_HASH_MISMATCH"])
+def test_settings_retry_clears_authentication_block(transport, plug, failure):
     adapter, device, factory = transport
-    device.get_device_info.side_effect = RuntimeError("Unauthorized")
+    device.get_device_info.side_effect = RuntimeError(failure)
     with pytest.raises(TapoError):
         adapter.send(STATUS, plug)
     adapter.reset_authentication()
@@ -184,3 +185,24 @@ def test_incomplete_saved_account_does_not_silently_use_environment(transport, p
     with pytest.raises(TapoError, match="credentials are missing"):
         adapter.send(STATUS, plug, credentials={"username": "saved@example.invalid"})
     factory.assert_not_called()
+
+
+def test_write_is_not_queued_behind_another_request(transport, plug):
+    adapter, device, _ = transport
+    entered = threading.Event()
+    release = threading.Event()
+    async def info():
+        entered.set()
+        await asyncio.to_thread(release.wait)
+        return Mock(to_dict=lambda: {'device_on':True})
+    device.get_device_info.side_effect = info
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(adapter.send, STATUS, plug)
+        assert entered.wait(2)
+        try:
+            with pytest.raises(TapoError, match='command was not sent'):
+                adapter.send(OFF, plug)
+        finally:
+            release.set()
+        assert pending.result()['system']['get_sysinfo']['relay_state']==1
+    device.off.assert_not_awaited()

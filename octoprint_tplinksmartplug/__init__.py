@@ -1,32 +1,35 @@
 # coding=utf-8
 from __future__ import absolute_import
 
-import octoprint.plugin
-from octoprint.access.permissions import Permissions, ADMIN_GROUP
-from octoprint.events import Events
-from octoprint.util import RepeatedTimer
-from flask_babel import gettext
-import socket
 import json
-import flask
+import asyncio
+import copy
 import logging
 import os
 import re
+import sqlite3
 import threading
 import time
-import sqlite3
-import sys
-import uuid
+from datetime import datetime, timedelta
+from typing import Optional
 
-from octoprint.util.version import is_octoprint_compatible
+import flask
+import octoprint.plugin
+from flask_babel import gettext
+from kasa import Device, Discover, Credentials, Module
+from kasa import __version__ as kasa_version
+from octoprint.access.permissions import Permissions, ADMIN_GROUP
+from octoprint.events import Events
+from octoprint.util import RepeatedTimer
+from octoprint.util.version import is_octoprint_compatible, is_version_compatible
+
 from uptime import uptime
-from datetime import datetime
-from struct import unpack
-from builtins import bytes
+
+from .worker import AsyncTaskWorker
 
 try:
 	from octoprint.util import ResettableTimer
-except:
+except ImportError:
 	class ResettableTimer(threading.Thread):
 		def __init__(self, interval, function, args=None, kwargs=None, on_reset=None, on_cancelled=None):
 			threading.Thread.__init__(self)
@@ -87,14 +90,19 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 							octoprint.plugin.ShutdownPlugin):
 
 	def __init__(self):
-		self._logger = logging.getLogger("octoprint.plugins.tplinksmartplug")
-		self._tplinksmartplug_logger = logging.getLogger("octoprint.plugins.tplinksmartplug.debug")
+		self.loaded = None
 		self._tapo_transport = None
 		self._tapo_transport_lock = threading.Lock()
+		self._storage_interface = None
+		self.idleTimeoutWaitTemp = None
+		self._idleIgnoreCommandsArray = None
+		self.idleIgnoreCommands = None
+		self.idleTimeout = None
+		self._logger = logging.getLogger("octoprint.plugins.tplinksmartplug")
+		self._tplinksmartplug_logger = logging.getLogger("octoprint.plugins.tplinksmartplug.debug")
 		self.abortTimeout = 0
 		self._timeout_value = None
 		self._abort_timer = None
-		self._countdown_active = False
 		self.print_job_power = 0.0
 		self.print_job_started = False
 		self._waitForHeaters = False
@@ -110,10 +118,13 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 		self._gcode_queued = False
 		self.active_timers = {"on": {}, "off": {}}
 		self.total_correction = 0
-		self.last_row = [0,0,0,0,0,0,0]
+		self.last_row = [0, 0, 0, 0, 0, 0, 0]
 		self.last_row_entered = False
 
-	##~~ StartupPlugin mixin
+		# create a thread pool for asyncio tasks
+		self.worker = AsyncTaskWorker()
+
+	# ~~ StartupPlugin mixin
 
 	def on_startup(self, host, port):
 		# setup customized logger
@@ -126,7 +137,7 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 		self._tplinksmartplug_logger.addHandler(tplinksmartplug_logging_handler)
 		self._tplinksmartplug_logger.setLevel(
 			logging.DEBUG if self._settings.get_boolean(["debug_logging"]) else logging.INFO)
-		self._tplinksmartplug_logger.propagate = False
+		# self._tplinksmartplug_logger.propagate = False
 
 		self.db_path = os.path.join(self.get_plugin_data_folder(), "energy_data.db")
 		if not os.path.exists(self.db_path):
@@ -138,15 +149,15 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 			db = sqlite3.connect(self.db_path)
 			cursor = db.cursor()
 
-		#Update 'energy_data' table schema if 'grandtotal' column not present
+		# Update 'energy_data' table schema if 'grandtotal' column not present
 		cursor.execute('''SELECT * FROM energy_data''')
 		if 'grandtotal' not in next(zip(*cursor.description)):
-			#Change type of 'timestamp' to 'DATETIME' (from 'TEXT'), add new 'grandtotal' column
+			# Change type of 'timestamp' to 'DATETIME' (from 'TEXT'), add new 'grandtotal' column
 			cursor.execute('''
 				ALTER TABLE energy_data RENAME TO _energy_data''')
 			cursor.execute('''
 				CREATE TABLE energy_data (id INTEGER PRIMARY KEY, ip TEXT, timestamp DATETIME, voltage REAL, current REAL, power REAL, total REAL, grandtotal REAL)''')
-			#Copy over table, skipping non-changed values and calculating running grandtotal
+			# Copy over table, skipping non-changed values and calculating running grandtotal
 			cursor.execute('''
 				INSERT INTO energy_data (ip, timestamp, voltage, current, power, total, grandtotal) SELECT ip, timestamp, voltage, current, power, total, grandtotal FROM
 					(WITH temptable AS (SELECT *, total - LAG(total,1) OVER(ORDER BY id) AS delta, LAG(power,1) OVER(ORDER BY id) AS power1 FROM _energy_data)
@@ -154,15 +165,16 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 					AS grandtotal FROM temptable WHERE power > 0 OR power1 > 0 OR delta <> 0 OR delta IS NULL)''')
 
 			cursor.execute('''DROP TABLE _energy_data''')
-			#Compact database
+			# Compact database
 			db.commit()
 			cursor.execute('''VACUUM''')
 
 		self.last_row = list(cursor.execute('''SELECT id, timestamp, voltage, current, power, total, grandtotal
-			FROM energy_data ORDER BY ROWID DESC LIMIT 1''').fetchone() or [0,0,0,0,0,0,0]) #Round to remove floating point imprecision
-		self.last_row = self.last_row[:2] + [round(x,6) for x in self.last_row[2:]] #Round to correct floating point imprecision in sqlite
+			FROM energy_data ORDER BY ROWID DESC LIMIT 1''').fetchone() or [0, 0, 0, 0, 0, 0,
+																			0])  # Round to remove floating point imprecision
+		self.last_row = self.last_row[:2] + [round(x, 6) for x in self.last_row[2:]]  # Round to correct floating point imprecision in sqlite
 		self.last_row_entered = True
-		self.total_correction = self.last_row[6] - self.last_row[5] #grandtotal - total
+		self.total_correction = self.last_row[6] - self.last_row[5]  # grandtotal - total
 		db.commit()
 		db.close()
 
@@ -173,83 +185,93 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 			self.poll_status.start()
 
 		self.abortTimeout = self._settings.get_int(["abortTimeout"])
-		self._tplinksmartplug_logger.debug("abortTimeout: %s" % self.abortTimeout)
+		self._tplinksmartplug_logger.debug(f"abortTimeout: {self.abortTimeout}")
 
-		self.powerOffWhenIdle = self._settings.get_boolean(["powerOffWhenIdle"])
-		self._tplinksmartplug_logger.debug("powerOffWhenIdle: %s" % self.powerOffWhenIdle)
+		self.powerOffWhenIdle = any(map(lambda plug_check: plug_check.get("automaticShutdownEnabled", False) is True, self._settings.get(["arrSmartplugs"])))
+		self._tplinksmartplug_logger.debug(f"powerOffWhenIdle: {self.powerOffWhenIdle}")
 
 		self.idleTimeout = self._settings.get_int(["idleTimeout"])
-		self._tplinksmartplug_logger.debug("idleTimeout: %s" % self.idleTimeout)
+		self._tplinksmartplug_logger.debug(f"idleTimeout: {self.idleTimeout}")
 		self.idleIgnoreCommands = self._settings.get(["idleIgnoreCommands"])
 		self._idleIgnoreCommandsArray = self.idleIgnoreCommands.replace(" ", "").split(',')
-		self._tplinksmartplug_logger.debug("idleIgnoreCommands: %s" % self.idleIgnoreCommands)
+		self._tplinksmartplug_logger.debug(f"idleIgnoreCommands: {self.idleIgnoreCommands}")
 		self.idleTimeoutWaitTemp = self._settings.get_int(["idleTimeoutWaitTemp"])
-		self._tplinksmartplug_logger.debug("idleTimeoutWaitTemp: %s" % self.idleTimeoutWaitTemp)
-		if self._settings.get_boolean(["event_on_startup_monitoring"]) is True:
+		self._tplinksmartplug_logger.debug(f"idleTimeoutWaitTemp: {self.idleTimeoutWaitTemp}")
+		if any(map(lambda plug_check: plug_check.get("event_on_startup", False) is True, self._settings.get(["arrSmartplugs"]))):
 			self._tplinksmartplug_logger.debug("powering on due to startup.")
 			for plug in self._settings.get(['arrSmartplugs']):
 				if plug["event_on_startup"] is True:
-					self._tplinksmartplug_logger.debug("powering on %s due to startup." % (plug["ip"]))
+					self._tplinksmartplug_logger.debug(f"powering on {plug['ip']} due to startup.")
 					response = self.turn_on(plug["ip"])
 					if response.get("currentState", False) == "on":
 						self._plugin_manager.send_plugin_message(self._identifier, response)
 					else:
-						self._tplinksmartplug_logger.debug("powering on %s during startup failed." % (plug["ip"]))
+						self._tplinksmartplug_logger.debug(f"powering on {plug['ip']} during startup failed.")
 		self._reset_idle_timer()
 		self.loaded = True
 
-	def on_connect(self, *args, **kwargs): #Power up on connect
-		if hasattr(self, 'loaded') is False: return None
+	# ~~ ShutdownPlugin mixin
+
+	def on_shutdown(self):
+		self.worker.shutdown()
+		if self._tapo_transport is not None:
+			self._tapo_transport.close()
+
+	def on_connect(self, *args, **kwargs):  # Power up on connect
+		if not hasattr(self, 'loaded'):
+			return None
 		if self._settings.get_boolean(["connect_on_connect_request"]) is True:
 			self._tplinksmartplug_logger.debug("powering on due to 'Connect' request.")
 			for plug in self._settings.get(['arrSmartplugs']):
 				if plug["connect_on_connect"] is True and self._printer.is_closed_or_error():
-					self._tplinksmartplug_logger.debug("powering on %s due to 'Connect' request." % (plug["ip"]))
+					self._tplinksmartplug_logger.debug(f"powering on {plug['ip']} due to 'Connect' request.")
 					response = self.turn_on(plug["ip"])
 					if response.get("currentState", False) == "on":
-						self._tplinksmartplug_logger.debug("powering on %s during 'Connect' succeeded." % (plug["ip"]))
+						self._tplinksmartplug_logger.debug(f"powering on {plug['ip']} during 'Connect' succeeded.")
 						self._plugin_manager.send_plugin_message(self._identifier, response)
 					else:
-						self._tplinksmartplug_logger.debug("powering on %s during 'Connect' failed." % (plug["ip"]))
+						self._tplinksmartplug_logger.debug(f"powering on {plug['ip']} during 'Connect' failed.")
 		return None
 
-	def on_shutdown(self):
-		if self._tapo_transport is not None:
-			self._tapo_transport.close()
-
-	##~~ SettingsPlugin mixin
+	# ~~ SettingsPlugin mixin
 
 	def get_settings_defaults(self):
-		return {'tapoCredentials': {}, 'debug_logging': False, 'arrSmartplugs': [], 'pollingInterval': 15, 'pollingEnabled': False,
+		return {'tapoCredentials': {}, 'event_on_startup_monitoring': False, 'event_on_upload_monitoring': False,
+				'event_on_error_monitoring': False, 'event_on_disconnect_monitoring': False, 'event_on_shutdown_monitoring': False, 'debug_logging': False, 'arrSmartplugs': [], 'pollingInterval': 15, 'pollingEnabled': False,
 				'thermal_runaway_monitoring': False, 'thermal_runaway_max_bed': 0, 'thermal_runaway_max_extruder': 0,
-				'event_on_error_monitoring': False, 'event_on_disconnect_monitoring': False,
-				'event_on_upload_monitoring': False, 'event_on_upload_monitoring_always': False,
-				'event_on_startup_monitoring': False, 'event_on_shutdown_monitoring': False, 'cost_rate': 0,
-				'abortTimeout': 30, 'powerOffWhenIdle': False, 'idleTimeout': 30, 'idleIgnoreCommands': 'M105',
-				'idleIgnoreHeaters': '', 'idleTimeoutWaitTemp': 50, 'progress_polling': False, 'useDropDown': False}
+				'cost_rate': 0, 'abortTimeout': 30, 'powerOffWhenIdle': False, 'idleTimeout': 30, 'idleIgnoreCommands': 'M105',
+				'idleIgnoreHeaters': '', 'idleTimeoutWaitTemp': 50, 'idleBypassDisconnected': False, 'progress_polling': False, 'useDropDown': False,
+				'device_configs': {}, 'connect_on_connect_request': False, 'username': '', 'password': ''}
 
 	def get_settings_restricted_paths(self):
-		return {"never": [["tapoCredentials"]]}
+		return {"never": [["tapoCredentials"], ["device_configs"], ["password"]]}
 
 	def on_settings_load(self):
 		from .tapo_credentials import public_plugs
 		data = octoprint.plugin.SettingsPlugin.on_settings_load(self)
 		data.pop("tapoCredentials", None)
+		data.pop("device_configs", None)
+		data["password"] = ""
+		data["passwordSet"] = bool(self._settings.get(["password"])) if Permissions.ADMIN.can() else False
+		data["clearDefaultCredentials"] = False
+		if not Permissions.ADMIN.can():
+			data["username"] = ""
 		data["arrSmartplugs"] = public_plugs(data.get("arrSmartplugs", []),
 			self._settings.get(["tapoCredentials"]) or {}, Permissions.ADMIN.can())
 		return data
 
 	def on_settings_save(self, data):
-		from .tapo_credentials import prepare_settings
+		from .tapo_credentials import prepare_settings, prepare_default_account
 		data, credentials = prepare_settings(data, self._settings.get(["arrSmartplugs"]) or [],
 			self._settings.get(["tapoCredentials"]) or {}, Permissions.ADMIN.can())
+		data = prepare_default_account(data, self._settings.get(["username"]) or "",
+			self._settings.get(["password"]) or "", Permissions.ADMIN.can())
+		data.pop("device_configs", None)
+
 		old_debug_logging = self._settings.get_boolean(["debug_logging"])
 		old_polling_value = self._settings.get_boolean(["pollingEnabled"])
 		old_polling_timer = self._settings.get(["pollingInterval"])
-		old_powerOffWhenIdle = self._settings.get_boolean(["powerOffWhenIdle"])
-		old_idleTimeout = self._settings.get_int(["idleTimeout"])
-		old_idleIgnoreCommands = self._settings.get(["idleIgnoreCommands"])
-		old_idleTimeoutWaitTemp = self._settings.get_int(["idleTimeoutWaitTemp"])
+		old_power_off_when_idle = self._settings.get_boolean(["powerOffWhenIdle"])
 
 		octoprint.plugin.SettingsPlugin.on_settings_save(self, data)
 		self._settings.set(["tapoCredentials"], credentials)
@@ -257,19 +279,19 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 			self._tapo_transport.reset_authentication()
 
 		self.abortTimeout = self._settings.get_int(["abortTimeout"])
-		self.powerOffWhenIdle = self._settings.get_boolean(["powerOffWhenIdle"])
+		self.powerOffWhenIdle = any(map(lambda plug_check: plug_check.get("automaticShutdownEnabled", False) is True, self._settings.get(["arrSmartplugs"])))
 
 		self.idleTimeout = self._settings.get_int(["idleTimeout"])
 		self.idleIgnoreCommands = self._settings.get(["idleIgnoreCommands"])
 		self._idleIgnoreCommandsArray = self.idleIgnoreCommands.replace(" ", "").split(',')
 		self.idleTimeoutWaitTemp = self._settings.get_int(["idleTimeoutWaitTemp"])
 
-		if self.powerOffWhenIdle != old_powerOffWhenIdle:
+		if self.powerOffWhenIdle != old_power_off_when_idle:
 			self._plugin_manager.send_plugin_message(self._identifier,
 													 dict(powerOffWhenIdle=self.powerOffWhenIdle, type="timeout",
 														  timeout_value=self._timeout_value))
 
-		if self.powerOffWhenIdle == True:
+		if self.powerOffWhenIdle:
 			self._tplinksmartplug_logger.debug("Settings saved, Automatic Power Off Enabled, starting idle timer...")
 			self._reset_idle_timer()
 
@@ -293,126 +315,140 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 				self.poll_status.start()
 
 	def get_settings_version(self):
-		return 18
+		return 19
 
 	def on_settings_migrate(self, target, current=None):
+		legacy_base = any("connect_on_connect" not in p for p in self._settings.get(["arrSmartplugs"]) or [])
 		if current is None or current < 5:
 			# Reset plug settings to defaults.
 			self._tplinksmartplug_logger.debug("Resetting arrSmartplugs for tplinksmartplug settings.")
 			self._settings.set(['arrSmartplugs'], self.get_settings_defaults()["arrSmartplugs"])
 		elif current == 6:
 			# Loop through plug array and set emeter to None
-			arrSmartplugs_new = []
+			arr_smartplugs_new = []
 			for plug in self._settings.get(['arrSmartplugs']):
 				plug["emeter"] = None
-				arrSmartplugs_new.append(plug)
+				arr_smartplugs_new.append(plug)
 
 			self._tplinksmartplug_logger.info("Updating plug array, converting")
 			self._tplinksmartplug_logger.info(self._settings.get(['arrSmartplugs']))
 			self._tplinksmartplug_logger.info("to")
-			self._tplinksmartplug_logger.info(arrSmartplugs_new)
-			self._settings.set(["arrSmartplugs"], arrSmartplugs_new)
+			self._tplinksmartplug_logger.info(arr_smartplugs_new)
+			self._settings.set(["arrSmartplugs"], arr_smartplugs_new)
 		elif current == 7:
 			# Loop through plug array and set emeter to None
-			arrSmartplugs_new = []
+			arr_smartplugs_new = []
 			for plug in self._settings.get(['arrSmartplugs']):
 				plug["emeter"] = dict(get_realtime=False)
-				arrSmartplugs_new.append(plug)
+				arr_smartplugs_new.append(plug)
 
 			self._tplinksmartplug_logger.info("Updating plug array, converting")
 			self._tplinksmartplug_logger.info(self._settings.get(['arrSmartplugs']))
 			self._tplinksmartplug_logger.info("to")
-			self._tplinksmartplug_logger.info(arrSmartplugs_new)
-			self._settings.set(["arrSmartplugs"], arrSmartplugs_new)
+			self._tplinksmartplug_logger.info(arr_smartplugs_new)
+			self._settings.set(["arrSmartplugs"], arr_smartplugs_new)
 
 		if current is not None and current < 9:
-			arrSmartplugs_new = []
+			arr_smartplugs_new = []
 			for plug in self._settings.get(['arrSmartplugs']):
 				plug["thermal_runaway"] = False
-				arrSmartplugs_new.append(plug)
-			self._settings.set(["arrSmartplugs"], arrSmartplugs_new)
+				arr_smartplugs_new.append(plug)
+			self._settings.set(["arrSmartplugs"], arr_smartplugs_new)
 
 		if current is not None and current < 10:
-			arrSmartplugs_new = []
+			arr_smartplugs_new = []
 			for plug in self._settings.get(['arrSmartplugs']):
 				plug["event_on_error"] = False
 				plug["event_on_disconnect"] = False
-				arrSmartplugs_new.append(plug)
-			self._settings.set(["arrSmartplugs"], arrSmartplugs_new)
+				arr_smartplugs_new.append(plug)
+			self._settings.set(["arrSmartplugs"], arr_smartplugs_new)
 
 		if current is not None and current < 11:
-			arrSmartplugs_new = []
+			arr_smartplugs_new = []
 			for plug in self._settings.get(['arrSmartplugs']):
 				plug["automaticShutdownEnabled"] = False
-				arrSmartplugs_new.append(plug)
-			self._settings.set(["arrSmartplugs"], arrSmartplugs_new)
+				arr_smartplugs_new.append(plug)
+			self._settings.set(["arrSmartplugs"], arr_smartplugs_new)
 
 		if current is not None and current < 12:
-			arrSmartplugs_new = []
+			arr_smartplugs_new = []
 			for plug in self._settings.get(['arrSmartplugs']):
 				plug["event_on_upload"] = False
-				arrSmartplugs_new.append(plug)
-			self._settings.set(["arrSmartplugs"], arrSmartplugs_new)
+				arr_smartplugs_new.append(plug)
+			self._settings.set(["arrSmartplugs"], arr_smartplugs_new)
 
 		if current is not None and current < 13:
-			arrSmartplugs_new = []
+			arr_smartplugs_new = []
 			for plug in self._settings.get(['arrSmartplugs']):
 				plug["event_on_startup"] = False
-				arrSmartplugs_new.append(plug)
-			self._settings.set(["arrSmartplugs"], arrSmartplugs_new)
+				arr_smartplugs_new.append(plug)
+			self._settings.set(["arrSmartplugs"], arr_smartplugs_new)
 
 		if current is not None and current < 14:
-			arrSmartplugs_new = []
+			arr_smartplugs_new = []
 			for plug in self._settings.get(['arrSmartplugs']):
 				if "/" in plug["ip"]:
 					plug_ip, plug_num = plug["ip"].split("/")
 					plug["ip"] = "{}/{}".format(plug_ip, int(plug_num) + 1)
-				arrSmartplugs_new.append(plug)
-			self._settings.set(["arrSmartplugs"], arrSmartplugs_new)
+				arr_smartplugs_new.append(plug)
+			self._settings.set(["arrSmartplugs"], arr_smartplugs_new)
 
 		if current is not None and current < 15:
-			arrSmartplugs_new = []
+			arr_smartplugs_new = []
 			for plug in self._settings.get(['arrSmartplugs']):
 				plug["gcodeCmdOn"] = False
 				plug["gcodeCmdOff"] = False
 				plug["gcodeRunCmdOn"] = ""
 				plug["gcodeRunCmdOff"] = ""
-				arrSmartplugs_new.append(plug)
-			self._settings.set(["arrSmartplugs"], arrSmartplugs_new)
+				arr_smartplugs_new.append(plug)
+			self._settings.set(["arrSmartplugs"], arr_smartplugs_new)
 
 		if current is not None and current < 16:
-			arrSmartplugs_new = []
+			arr_smartplugs_new = []
 			for plug in self._settings.get(['arrSmartplugs']):
 				plug["event_on_shutdown"] = False
-				arrSmartplugs_new.append(plug)
-			self._settings.set(["arrSmartplugs"], arrSmartplugs_new)
+				arr_smartplugs_new.append(plug)
+			self._settings.set(["arrSmartplugs"], arr_smartplugs_new)
 
-		if current is None or current < 17:
-			plugs = self._settings.get(["arrSmartplugs"])
-			for plug in plugs:
-				plug.setdefault("backend", "kasa")
-				plug.setdefault("tapoUsernameEnv", "TAPO_USERNAME")
-				plug.setdefault("tapoPasswordEnv", "TAPO_PASSWORD")
-			self._settings.set(["arrSmartplugs"], plugs)
+		if current is not None and current < 17:
+			arr_smartplugs_new = []
+			device_configs = {}
+			for plug in self._settings.get(['arrSmartplugs']):
+				plug["connect_on_connect"] = False
+				arr_smartplugs_new.append(plug)
+				# attempt to get device_config
+				if plug["ip"] != "":
+					device_config = (self._settings.get(["device_configs"]) or {}).get(plug["ip"])
+					if device_config:
+						device_configs[plug["ip"]] = device_config
+			self._settings.set(["device_configs"], device_configs)
+			self._settings.set(["arrSmartplugs"], arr_smartplugs_new)
 
-		if current is None or current < 18:
-			plugs = self._settings.get(["arrSmartplugs"])
-			for plug in plugs:
-				plug.setdefault("tapoCredentialId", str(uuid.uuid4()))
-			self._settings.set(["arrSmartplugs"], plugs)
+		if current is not None and current < 18:
+			arr_smartplugs_new = []
+			for plug in self._settings.get(['arrSmartplugs']):
+				plug["receives_led_commands"] = False
+				arr_smartplugs_new.append(plug)
+			self._settings.set(["arrSmartplugs"], arr_smartplugs_new)
 
-	##~~ AssetPlugin mixin
+		if current is None or current < 19:
+			from .migration import migrate_v2_settings
+			data = {key: self._settings.get([key]) for key in
+				("arrSmartplugs", "tapoCredentials", "device_configs", "username", "password", "powerOffWhenIdle")}
+			if legacy_base:
+				for event in ("startup", "upload", "error", "disconnect", "shutdown"):
+					data["event_on_" + event + "_monitoring"] = self._settings.get(["event_on_" + event + "_monitoring"])
+			data = migrate_v2_settings(data, legacy_base)
+			for key in ("arrSmartplugs", "tapoCredentials", "device_configs"):
+				self._settings.set([key], data[key])
+
+	# ~~ AssetPlugin mixin
 
 	def get_assets(self):
-		css = ["css/fontawesome-iconpicker.css",
-			   "css/tplinksmartplug.css",
-			   ]
+		css = ["css/fontawesome-iconpicker.css", "css/tplinksmartplug.css"]
 
 		if not is_octoprint_compatible(">=1.5.0"):
-			css += [
-				"css/font-awesome.min.css",
-				"css/font-awesome-v4-shims.min.css",
-			]
+			css += ["css/font-awesome.min.css", "css/font-awesome-v4-shims.min.css"]
 
 		return {'js': ["js/jquery-ui.min.js",
 					   "js/knockout-sortable.1.2.0.js",
@@ -424,7 +460,10 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 					   "js/plotly-latest.min.js"],
 				'css': css}
 
-	##~~ TemplatePlugin mixin
+	# ~~ TemplatePlugin mixin
+
+	def is_template_autoescaped(self):
+		return True
 
 	def get_template_configs(self):
 		templates_to_load = [{'type': "navbar", 'custom_bindings': True, 'classes': ["dropdown"]},
@@ -437,122 +476,96 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 							  'template': "tplinksmartplug_tab.jinja2"}]
 		return templates_to_load
 
-	##~~ ProgressPlugin mixin
+	# ~~ ProgressPlugin mixin
 
 	def on_print_progress(self, storage, path, progress):
 		if self._settings.get_boolean(["progress_polling"]) is False:
 			return
-		self._tplinksmartplug_logger.debug("Checking statuses during print progress (%s)." % progress)
+		self._tplinksmartplug_logger.debug(f"Checking statuses during print progress ({progress}).")
 		_print_progress_timer = threading.Timer(1, self.check_statuses)
 		_print_progress_timer.daemon = True
 		_print_progress_timer.start()
 		self._plugin_manager.send_plugin_message(self._identifier, dict(updatePlot=True))
 
 		if self.powerOffWhenIdle is True and not (self._skipIdleTimer is True):
-			self._tplinksmartplug_logger.debug("Resetting idle timer during print progress (%s)..." % progress)
+			self._tplinksmartplug_logger.debug(f"Resetting idle timer during print progress ({progress})...")
 			self._waitForHeaters = False
 			self._reset_idle_timer()
 
-	##~~ SimpleApiPlugin mixin
+	# ~~ SimpleApiPlugin mixin
+
+	async def turn_on_device(self, plug_device):
+		await plug_device.turn_on()
+		await plug_device.update()
+		return plug_device
+
+	async def turn_off_device(self, plug_device):
+		await plug_device.turn_off()
+		await plug_device.update()
+		return plug_device
 
 	def turn_on(self, plugip):
-		self._tplinksmartplug_logger.debug("Turning on %s." % plugip)
 		plug = self.plug_search(self._settings.get(["arrSmartplugs"]), "ip", plugip)
-		self._tplinksmartplug_logger.debug(plug)
-		if plug.get("backend", "kasa") == "tapo" and plug.get("useCountdownRules"):
-			return dict(ip=plugip, currentState="unknown", emeter=None,
-				error="Device countdown timers are not supported for Tapo. Disable Use Timers before switching.")
-		if "/" in plugip:
-			plug_ip, plug_num = plugip.split("/")
-		else:
-			plug_ip = plugip
-			plug_num = 0
-		if plug["useCountdownRules"] and int(plug["countdownOnDelay"]) > 0:
-			self.sendCommand(json.loads('{"count_down":{"delete_all_rules":null}}'), plug_ip, plug_num)
-			chk = self.lookup(self.sendCommand(json.loads(
-				'{"count_down":{"add_rule":{"enable":1,"delay":%s,"act":1,"name":"turn on"}}}' % plug[
-					"countdownOnDelay"]), plug_ip, plug_num), *["count_down", "add_rule", "err_code"])
-			if chk == 0:
-				self._countdown_active = True
-				c = threading.Timer(int(plug["countdownOnDelay"]) + 3, self._plugin_manager.send_plugin_message,
-									[self._identifier, dict(check_status=True, ip=plugip)])
-				c.daemon = True
-				c.start()
-		else:
-			turn_on_cmnd = dict(system=dict(set_relay_state=dict(state=1)))
-			chk = self.lookup(self.sendCommand(turn_on_cmnd, plug_ip, plug_num),
-							  *["system", "set_relay_state", "err_code"])
-
-		self._tplinksmartplug_logger.debug(chk)
-		if plug.get("backend", "kasa") == "tapo" and chk != 0:
-			return dict(ip=plugip, currentState="unknown", emeter=None,
-				error="Tapo switching failed. Check the plugin log; the command was not retried.")
-		if chk == 0:
-			if plug["autoConnect"] and self._printer.is_closed_or_error():
-				c = threading.Timer(int(plug["autoConnectDelay"]), self._printer.connect)
-				c.daemon = True
-				c.start()
-			if plug["gcodeCmdOn"] and self._printer.is_closed_or_error():
-				self._tplinksmartplug_logger.debug("queuing gcode on commands because printer isn't connected yet.")
-				self._gcode_queued = True
-			if plug["gcodeCmdOn"] and self._printer.is_ready() and plug["gcodeRunCmdOn"] != "":
-				self._tplinksmartplug_logger.debug("sending gcode commands to printer.")
-				self._printer.commands(plug["gcodeRunCmdOn"].split("\n"))
-			if plug["sysCmdOn"]:
-				t = threading.Timer(int(plug["sysCmdOnDelay"]), os.system, args=[plug["sysRunCmdOn"]])
-				t.daemon = True
-				t.start()
-			if self.powerOffWhenIdle is True and plug["automaticShutdownEnabled"] is True:
-				self._tplinksmartplug_logger.debug("Resetting idle timer since plug %s was just turned on." % plugip)
-				self._waitForHeaters = False
-				self._reset_idle_timer()
+		if plug and plug.get("useCountdownRules"):
+			from .tapo_transport import TapoError
+			return self._device_error(plugip, TapoError("Device countdown timers were removed in 2.0. Disable the old timer setting explicitly before switching."))
+		self._tplinksmartplug_logger.debug(f"Turning on {plugip}.")
+		try:
+			plug_device = self.get_device(plugip)
+			plug_device = self._run_device_task(self.turn_on_device(plug_device))
+			self._tplinksmartplug_logger.debug(f"Turn on result: {plug_device.is_on}.")
+			if plug_device and plug_device.is_on:
+				plug = self.plug_search(self._settings.get(["arrSmartplugs"]), "ip", plugip)
+				self._tplinksmartplug_logger.debug(plug)
+				if plug["autoConnect"] and self._printer.is_closed_or_error():
+					c = threading.Timer(int(plug["autoConnectDelay"]), self._printer.connect)
+					c.daemon = True
+					c.start()
+				if plug["gcodeCmdOn"] and self._printer.is_closed_or_error():
+					self._tplinksmartplug_logger.debug("queuing gcode on commands because printer isn't connected yet.")
+					self._gcode_queued = True
+				if plug["gcodeCmdOn"] and self._printer.is_ready() and plug["gcodeRunCmdOn"] != "":
+					self._tplinksmartplug_logger.debug("sending gcode commands to printer.")
+					self._printer.commands(plug["gcodeRunCmdOn"].split("\n"))
+				if plug["sysCmdOn"]:
+					t = threading.Timer(int(plug["sysCmdOnDelay"]), os.system, args=[plug["sysRunCmdOn"]])
+					t.daemon = True
+					t.start()
+				if self.powerOffWhenIdle is True and plug["automaticShutdownEnabled"] is True:
+					self._tplinksmartplug_logger.debug(f"Resetting idle timer since plug {plugip} was just turned on.")
+					self._waitForHeaters = False
+					self._reset_idle_timer()
+		except Exception as e:
+			return self._device_error(plugip, e)
 
 		return self.check_status(plugip)
 
 	def turn_off(self, plugip):
-		timenow = datetime.now()
-		self._tplinksmartplug_logger.debug("Turning off %s." % plugip)
-		self._tplinksmartplug_logger.info("Turning off %s at %s" % (plugip, timenow))
 		plug = self.plug_search(self._settings.get(["arrSmartplugs"]), "ip", plugip)
-		self._tplinksmartplug_logger.debug(plug)
-		if plug.get("backend", "kasa") == "tapo" and plug.get("useCountdownRules"):
-			return dict(ip=plugip, currentState="unknown", emeter=None,
-				error="Device countdown timers are not supported for Tapo. Disable Use Timers before switching.")
-		if "/" in plugip:
-			plug_ip, plug_num = plugip.split("/")
-		else:
-			plug_ip = plugip
-			plug_num = 0
-		if plug["useCountdownRules"] and int(plug["countdownOffDelay"]) > 0:
-			self.sendCommand(json.loads('{"count_down":{"delete_all_rules":null}}'), plug_ip, plug_num)
-			chk = self.lookup(self.sendCommand(json.loads(
-				'{"count_down":{"add_rule":{"enable":1,"delay":%s,"act":0,"name":"turn off"}}}' % plug[
-					"countdownOffDelay"]), plug_ip, plug_num), *["count_down", "add_rule", "err_code"])
-			if chk == 0:
-				self._countdown_active = True
-				c = threading.Timer(int(plug["countdownOffDelay"]) + 3, self._plugin_manager.send_plugin_message,
-									[self._identifier, dict(check_status=True, ip=plugip)])
-				c.start()
-		if plug["gcodeCmdOff"] and plug["gcodeRunCmdOff"] != "":
-			self._tplinksmartplug_logger.debug("sending gcode commands to printer.")
-			self._printer.commands(plug["gcodeRunCmdOff"].split("\n"))
-		if plug["sysCmdOff"]:
-			t = threading.Timer(int(plug["sysCmdOffDelay"]), os.system, args=[plug["sysRunCmdOff"]])
-			t.daemon = True
-			t.start()
-		if plug["autoDisconnect"]:
-			self._printer.disconnect()
-			time.sleep(int(plug["autoDisconnectDelay"]))
+		if plug and plug.get("useCountdownRules"):
+			from .tapo_transport import TapoError
+			return self._device_error(plugip, TapoError("Device countdown timers were removed in 2.0. Disable the old timer setting explicitly before switching."))
+		self._tplinksmartplug_logger.debug(f"Turning off {plugip}")
+		try:
+			plug_device = self.get_device(plugip)
+			plug = self.plug_search(self._settings.get(["arrSmartplugs"]), "ip", plugip)
+			self._tplinksmartplug_logger.debug(plug)
+			if plug["gcodeCmdOff"] and plug["gcodeRunCmdOff"] != "":
+				self._tplinksmartplug_logger.debug("sending gcode commands to printer.")
+				self._printer.commands(plug["gcodeRunCmdOff"].split("\n"))
+			if plug["sysCmdOff"]:
+				t = threading.Timer(int(plug["sysCmdOffDelay"]), os.system, args=[plug["sysRunCmdOff"]])
+				t.daemon = True
+				t.start()
+			if plug["autoDisconnect"]:
+				self._printer.disconnect()
+				time.sleep(int(plug["autoDisconnectDelay"]))
 
-		if not plug["useCountdownRules"]:
-			turn_off_cmnd = dict(system=dict(set_relay_state=dict(state=0)))
-			chk = self.lookup(self.sendCommand(turn_off_cmnd, plug_ip, plug_num),
-							  *["system", "set_relay_state", "err_code"])
+			plug_device = self._run_device_task(self.turn_off_device(plug_device))
+			self._tplinksmartplug_logger.debug(f"Turn off result: {plug_device.is_on}.")
 
-		self._tplinksmartplug_logger.debug(chk)
-		if plug.get("backend", "kasa") == "tapo" and chk != 0:
-			return dict(ip=plugip, currentState="unknown", emeter=None,
-				error="Tapo switching failed. Check the plugin log; the command was not retried.")
+		except Exception as e:
+			return self._device_error(plugip, e)
 
 		return self.check_status(plugip)
 
@@ -562,72 +575,39 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 			self._plugin_manager.send_plugin_message(self._identifier, chk)
 
 	def check_status(self, plugip):
-		self._tplinksmartplug_logger.debug("Checking status of %s." % plugip)
+		self._tplinksmartplug_logger.debug(f"Checking status of {plugip}.")
+		emeter_data = None
+		today = datetime.today()
 		if plugip != "":
-			emeter_data = None
-			today = datetime.today()
-			check_status_cmnd = dict(system=dict(get_sysinfo=dict()))
-			plug_ip = plugip.split("/")
-			self._tplinksmartplug_logger.debug(check_status_cmnd)
-			if len(plug_ip) == 2:
-				response = self.sendCommand(check_status_cmnd, plug_ip[0], plug_ip[1])
-				timer_chk = self.lookup(response, *["system", "get_sysinfo", "children"])[int(plug_ip[1]) - 1][
-					"on_time"]
-			else:
-				response = self.sendCommand(check_status_cmnd, plug_ip[0])
-				timer_chk = self.deep_get(response, ["system", "get_sysinfo", "on_time"], default=0)
+			try:
+				plug_device = self.get_device(plugip)
+			except Exception as error:
+				return self._device_error(plugip, error)
 
-			if timer_chk == 0 and self._countdown_active:
-				self._tplinksmartplug_logger.debug("Clearing previously active countdown timer flag")
-				self._countdown_active = False
+			if plug_device:
+				self._tplinksmartplug_logger.debug(plug_device.state_information)
+				chk = plug_device.is_on
 
-			self._tplinksmartplug_logger.debug(
-				self.deep_get(response, ["system", "get_sysinfo", "feature"], default=""))
-			if "ENE" in self.deep_get(response, ["system", "get_sysinfo", "feature"], default=""):
-				# if "ENE" in self.lookup(response, *["system","get_sysinfo","feature"]):
-				emeter_data_cmnd = dict(emeter=dict(get_realtime=dict()))
-				if len(plug_ip) == 2:
-					check_emeter_data = self.sendCommand(emeter_data_cmnd, plug_ip[0], plug_ip[1])
-				else:
-					check_emeter_data = self.sendCommand(emeter_data_cmnd, plug_ip[0])
-				if self.lookup(check_emeter_data, *["emeter", "get_realtime"]):
-					emeter_data = check_emeter_data["emeter"]
-					if "voltage_mv" in emeter_data["get_realtime"]:
-						v = emeter_data["get_realtime"]["voltage_mv"] / 1000.0
-					elif "voltage" in emeter_data["get_realtime"]:
-						v = emeter_data["get_realtime"]["voltage"]
-					else:
-						v = ""
-					if "current_ma" in emeter_data["get_realtime"]:
-						c = emeter_data["get_realtime"]["current_ma"] / 1000.0
-					elif "current" in emeter_data["get_realtime"]:
-						c = emeter_data["get_realtime"]["current"]
-					else:
-						c = ""
-					if "power_mw" in emeter_data["get_realtime"]:
-						p = emeter_data["get_realtime"]["power_mw"] / 1000.0
-					elif "power" in emeter_data["get_realtime"]:
-						p = emeter_data["get_realtime"]["power"]
-					else:
-						p = ""
-					if "total_wh" in emeter_data["get_realtime"]:
-						t = emeter_data["get_realtime"]["total_wh"] / 1000.0
-						emeter_data["get_realtime"]["total_wh"] += self.total_correction * 1000.0 #Add back total correction factor, so becomes grandtotal
-					elif "total" in emeter_data["get_realtime"]:
-						t = emeter_data["get_realtime"]["total"]
-						emeter_data["get_realtime"]["total"] += self.total_correction  #Add back total correction factor, so becomes grandtotal
-					else:
-						t = ""
+				if plug_device.has_emeter:
+					v = plug_device.state_information.get("Voltage", 0.0)
+					c = plug_device.state_information.get("Current", 0.0)
+					p = plug_device.state_information.get("Current consumption", 0.0)
+					t = plug_device.state_information.get("Total consumption since reboot", 0.0)
+
+					# fake old response data
+					emeter_data = {'get_realtime': {'voltage': v, 'current': c, 'power': p, 'total': t, 'err_code': 0}}
+
 					if self.db_path is not None:
 						last_p = self.last_row[4]
 						last_t = self.last_row[5]
 
-						if last_t is not None and t < last_t: #total has reset since last measurement
+						if last_t is not None and t < last_t:  # total has reset since last measurement
 							self.total_correction += last_t
-						gt = round(t + self.total_correction, 6) #Prevent accumulated floating-point rounding errors
+							emeter_data["get_realtime"]["total"] = round(t + self.total_correction, 6)
+						gt = round(t + self.total_correction, 6)  # Prevent accumulated floating-point rounding errors
 						current_row = [plugip, today.isoformat(' '), v, c, p, t, gt]
 
-						if self.last_row_entered is False and last_p == 0 and p > 0: #Go back & enter last_row on power return (if not entered already)
+						if self.last_row_entered is False and last_p == 0 and p > 0:  # Go back and enter last_row on power return (if not entered already)
 							db = sqlite3.connect(self.db_path)
 							cursor = db.cursor()
 							cursor.execute(
@@ -639,7 +619,7 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 						else:
 							self.last_row_entered = False
 
-						if t != last_t or p > 0 or last_p > 0: #Enter current_row if change in total or power is on or just turned off
+						if t != last_t or p > 0 or last_p > 0:  # Enter current_row if change in total or power is on or just turned off
 							db = sqlite3.connect(self.db_path)
 							cursor = db.cursor()
 							cursor.execute(
@@ -650,20 +630,15 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 
 						self.last_row = current_row
 
-			if len(plug_ip) == 2:
-				chk = self.lookup(response, *["system", "get_sysinfo", "children"])
-				if chk:
-					chk = chk[int(plug_ip[1]) - 1]["state"]
-			else:
-				chk = self.lookup(response, *["system", "get_sysinfo", "relay_state"])
+				if chk == 1:
+					return dict(currentState="on", emeter=emeter_data, ip=plugip)
+				elif chk == 0:
+					return dict(currentState="off", emeter=emeter_data, ip=plugip)
 
-			if chk == 1:
-				return dict(currentState="on", emeter=emeter_data, ip=plugip)
-			elif chk == 0:
-				return dict(currentState="off", emeter=emeter_data, ip=plugip)
-			else:
-				self._tplinksmartplug_logger.debug(response)
-				return dict(currentState="unknown", emeter=emeter_data, ip=plugip, error=response.get("error", ""))
+		return {'currentState': "unknown", 'emeter': emeter_data, 'ip': plugip}
+
+	def is_api_protected(self):
+		return True
 
 	def get_api_commands(self):
 		return dict(
@@ -674,17 +649,26 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 			enableAutomaticShutdown=[],
 			disableAutomaticShutdown=[],
 			abortAutomaticShutdown=[],
-			getListPlug=[])
+			getListPlug=[],
+			discoverDevices=["username", "password"])
 
 	def on_api_get(self, request):
+		if not Permissions.PLUGIN_TPLINKSMARTPLUG_CONTROL.can():
+			return flask.make_response("Insufficient rights", 403)
+
+		response = None
 		self._tplinksmartplug_logger.debug(request.args)
+
 		if request.args.get("checkStatus"):
 			response = self.check_status(request.args.get("checkStatus"))
-			return flask.jsonify(response)
+
+		return flask.jsonify(response)
 
 	def on_api_command(self, command, data):
 		if not Permissions.PLUGIN_TPLINKSMARTPLUG_CONTROL.can():
 			return flask.make_response("Insufficient rights", 403)
+
+		response = None
 
 		if command == 'turnOn':
 			response = self.turn_on("{ip}".format(**data))
@@ -696,10 +680,18 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 			response = self.check_status("{ip}".format(**data))
 		elif command == 'getEnergyData':
 			db = sqlite3.connect(self.db_path)
+			if "start_date" in data and data["start_date"] != "":
+				start_date = data["start_date"]
+			else:
+				start_date = datetime.today().date() - timedelta(days=1)
+			if "end_date" in data and data["end_date"] != "":
+				end_date = data["end_date"]
+			else:
+				end_date = datetime.today().date() + timedelta(days=1)
 			cursor = db.cursor()
 			cursor.execute(
-				'''SELECT timestamp, current, power, grandtotal, voltage FROM energy_data WHERE ip=? ORDER BY timestamp DESC LIMIT ?,?''',
-				(data["ip"], data["record_offset"], data["record_limit"]))
+				'''SELECT timestamp, current, power, grandtotal, voltage FROM energy_data WHERE ip=? AND timestamp BETWEEN ? AND ? ORDER BY timestamp DESC''',
+				(data["ip"], start_date, end_date))
 			response = {'energy_data': cursor.fetchall()}
 			db.close()
 			self._tplinksmartplug_logger.debug(response)
@@ -719,66 +711,68 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 				self._abort_timer.cancel()
 				self._abort_timer = None
 			self._timeout_value = None
-			for plug in self._settings.get(["arrSmartplugs"]):
-				if plug["useCountdownRules"] and int(plug["countdownOffDelay"]) > 0:
-					if "/" in plug["ip"]:
-						plug_ip, plug_num = plug["ip"].split("/")
-					else:
-						plug_ip = plug["ip"]
-						plug_num = 0
-					self.sendCommand(json.loads('{"count_down":{"delete_all_rules":null}}'), plug_ip, plug_num)
-					self._tplinksmartplug_logger.debug("Cleared countdown rules for %s" % plug["ip"])
 			self._tplinksmartplug_logger.debug("Power off aborted.")
 			self._tplinksmartplug_logger.debug("Restarting idle timer.")
 			self._reset_idle_timer()
 		elif command == "getListPlug":
 			from .tapo_credentials import public_plugs
 			return json.dumps(public_plugs(self._settings.get(["arrSmartplugs"]), {}))
+		elif command == "discoverDevices":
+			username = self._settings.get(["username"]) or None
+			password = self._settings.get(["password"]) or None
+			if not Permissions.ADMIN.can():
+				return flask.make_response("Only administrators can discover devices with account credentials", 403)
+			if "username" in data and data["username"] != "":
+				username = data["username"]
+			if "password" in data and data["password"] != "":
+				password = data["password"]
+			found_devices = self._run_device_task(self.discover_devices(username, password))
+			response = {'discovered_devices': found_devices}
 		else:
 			response = dict(ip="{ip}".format(**data), currentState="unknown")
+
 		if command == "enableAutomaticShutdown" or command == "disableAutomaticShutdown":
-			self._tplinksmartplug_logger.debug("Automatic power off setting changed: %s" % self.powerOffWhenIdle)
+			self._tplinksmartplug_logger.debug(f"Automatic power off setting changed: {self.powerOffWhenIdle}")
 			self._settings.set_boolean(["powerOffWhenIdle"], self.powerOffWhenIdle)
 			self._settings.save()
-		# eventManager().fire(Events.SETTINGS_UPDATED)
 		if command == "enableAutomaticShutdown" or command == "disableAutomaticShutdown" or command == "abortAutomaticShutdown":
 			self._plugin_manager.send_plugin_message(self._identifier,
 													 dict(powerOffWhenIdle=self.powerOffWhenIdle, type="timeout",
 														  timeout_value=self._timeout_value))
-		else:
-			return flask.jsonify(response)
 
-	##~~ EventHandlerPlugin mixin
+		return flask.jsonify(response)
+
+	# ~~ EventHandlerPlugin mixin
 
 	def on_event(self, event, payload):
 		# Startup Event
-		if event == Events.STARTUP and self._settings.get_boolean(["event_on_startup_monitoring"]) is True:
-			self._tplinksmartplug_logger.debug("powering on due to %s event." % event)
+		if event == Events.STARTUP and any(map(lambda plug_check: plug_check.get("event_on_startup", False) is True, self._settings.get(["arrSmartplugs"]))) is True:
+			self._tplinksmartplug_logger.debug(f"powering on due to {event} event.")
 			for plug in self._settings.get(['arrSmartplugs']):
 				if plug["event_on_startup"] is True:
-					self._tplinksmartplug_logger.debug("powering on %s due to %s event." % (plug["ip"], event))
+					self._tplinksmartplug_logger.debug(f"powering on {plug['ip']} due to {event} event.")
 					response = self.turn_on(plug["ip"])
 					if response["currentState"] == "on":
 						self._plugin_manager.send_plugin_message(self._identifier, response)
 		# Error Event
-		if event == Events.ERROR and self._settings.get_boolean(["event_on_error_monitoring"]) is True:
-			self._tplinksmartplug_logger.debug("powering off due to %s event." % event)
+		if event == Events.ERROR and any(map(lambda plug_check: plug_check.get("event_on_error", False) is True, self._settings.get(["arrSmartplugs"]))) is True:
+			self._tplinksmartplug_logger.debug(f"powering off due to {event} event.")
 			for plug in self._settings.get(['arrSmartplugs']):
 				if plug["event_on_error"] is True:
-					self._tplinksmartplug_logger.debug("powering off %s due to %s event." % (plug["ip"], event))
+					self._tplinksmartplug_logger.debug(f"powering off {plug['ip']} due to {event} event.")
 					response = self.turn_off(plug["ip"])
 					if response["currentState"] == "off":
 						self._plugin_manager.send_plugin_message(self._identifier, response)
 		# Client Opened Event
 		if event == Events.CLIENT_OPENED:
-			if self._settings.get_boolean(["powerOffWhenIdle"]):
-				self._tplinksmartplug_logger.debug("resetting idle timer due to %s event." % event)
+			if any(map(lambda plug_check: plug_check.get("automaticShutdownEnabled", False) is True, self._settings.get(["arrSmartplugs"]))):
+				self._tplinksmartplug_logger.debug(f"resetting idle timer due to {event} event.")
 				self._reset_idle_timer()
 			self._plugin_manager.send_plugin_message(self._identifier,
 													 dict(powerOffWhenIdle=self.powerOffWhenIdle, type="timeout",
 														  timeout_value=self._timeout_value))
 			return
-		# Cancelled Print Interpreted Event
+		# Canceled Print Interpreted Event
 		if event == Events.PRINT_FAILED and not self._printer.is_closed_or_error():
 			self._tplinksmartplug_logger.debug("Print cancelled, resetting job_power to 0")
 			self.print_job_power = 0.0
@@ -808,16 +802,6 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 													 dict(powerOffWhenIdle=self.powerOffWhenIdle, type="timeout",
 														  timeout_value=self._timeout_value))
 
-		if event == Events.PRINT_STARTED and self._countdown_active:
-			for plug in self._settings.get(["arrSmartplugs"]):
-				if plug["useCountdownRules"] and int(plug["countdownOffDelay"]) > 0:
-					if "/" in plug["ip"]:
-						plug_ip, plug_num = plug["ip"].split("/")
-					else:
-						plug_ip = plug["ip"]
-						plug_num = 0
-					self.sendCommand(json.loads('{"count_down":{"delete_all_rules":null}}'), plug_ip, plug_num)
-					self._tplinksmartplug_logger.debug("Cleared countdown rules for %s" % plug["ip"])
 		# Print Done Event
 		if event == Events.PRINT_DONE and self.print_job_started:
 			self._tplinksmartplug_logger.debug(payload)
@@ -830,11 +814,11 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 				self._tplinksmartplug_logger.debug(self.print_job_power)
 
 			hours = (payload.get("time", 0) / 60) / 60
-			self._tplinksmartplug_logger.debug("hours: %s" % hours)
+			self._tplinksmartplug_logger.debug(f"hours: {hours}")
 			power_used = self.print_job_power
-			self._tplinksmartplug_logger.debug("power used: %s" % power_used)
+			self._tplinksmartplug_logger.debug(f"power used: {power_used}")
 			power_cost = power_used * self._settings.get_float(["cost_rate"])
-			self._tplinksmartplug_logger.debug("power total cost: %s" % power_cost)
+			self._tplinksmartplug_logger.debug(f"power total cost: {power_cost}")
 
 			self._storage_interface = self._file_manager._storage(payload.get("origin", "local"))
 			self._storage_interface.set_additional_metadata(payload.get("path"), "statistics", dict(
@@ -845,19 +829,19 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 			self._autostart_file = None
 
 		if event == Events.PRINT_DONE and len(self.power_off_queue) > 0:
-			self._tplinksmartplug_logger.debug("power_off_queue: {}".format(self.power_off_queue))
+			self._tplinksmartplug_logger.debug(f"power_off_queue: {self.power_off_queue}")
 			for plug in self.power_off_queue:
 				chk = self.turn_off(plug["ip"])
 				self._plugin_manager.send_plugin_message(self._identifier, chk)
 			self.power_off_queue = []
 
 		if self.powerOffWhenIdle is True and event == Events.MOVIE_RENDERING:
-			self._tplinksmartplug_logger.debug("Timelapse generation started: %s" % payload.get("movie_basename", ""))
+			self._tplinksmartplug_logger.debug(f"Timelapse generation started: {payload.get('movie_basename', '')}")
 			self._timelapse_active = True
 
 		if self._timelapse_active and event == Events.MOVIE_DONE or event == Events.MOVIE_FAILED:
-			self._tplinksmartplug_logger.debug("Timelapse generation finished: %s. Return Code: %s" % (
-				payload.get("movie_basename", ""), payload.get("returncode", "completed")))
+			self._tplinksmartplug_logger.debug(
+				f"Timelapse generation finished: {payload.get('movie_basename', '')}. Return Code: {payload.get('returncode', 'completed')}")
 			self._timelapse_active = False
 		# Printer Connected Event
 		if event == Events.CONNECTED:
@@ -868,36 +852,31 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 						self._printer.commands(plug["gcodeRunCmdOn"].split("\n"))
 				self._gcode_queued = False
 			if self._autostart_file:
-				self._tplinksmartplug_logger.debug("printer connected starting print of %s" % self._autostart_file)
+				self._tplinksmartplug_logger.debug(f"printer connected starting print of {self._autostart_file}")
 				self._printer.select_file(self._autostart_file, False, printAfterSelect=True)
 				self._autostart_file = None
 		# File Uploaded Event
-		if event == Events.UPLOAD and self._settings.get_boolean(["event_on_upload_monitoring"]):
-			if payload.get("print", False) or self._settings.get_boolean(
-					["event_on_upload_monitoring_always"]):	 # implemented in OctoPrint version 1.4.1
-				self._tplinksmartplug_logger.debug(
-					"File uploaded: %s. Turning enabled plugs on." % payload.get("name", ""))
-				self._tplinksmartplug_logger.debug(payload)
-				for plug in self._settings.get(['arrSmartplugs']):
-					self._tplinksmartplug_logger.debug(plug)
-					if plug["event_on_upload"] is True and self._printer.is_closed_or_error():
-						self._tplinksmartplug_logger.debug("powering on %s due to %s event." % (plug["ip"], event))
-						response = self.turn_on(plug["ip"])
-						if response["currentState"] == "on":
-							self._tplinksmartplug_logger.debug(
-								"power on successful for %s attempting connection in %s seconds" % (
-									plug["ip"], plug.get("autoConnectDelay", "0")))
-							self._plugin_manager.send_plugin_message(self._identifier, response)
-							if payload.get("path", False) and payload.get("target") == "local":
-								self._autostart_file = payload.get("path")
+		if event == Events.UPLOAD and any(map(lambda plug_check: plug_check.get("event_on_upload", False) is True, self._settings.get(["arrSmartplugs"]))) is True:
+			self._tplinksmartplug_logger.debug(f"File uploaded: {payload.get('name', '')}. Turning enabled plugs on.")
+			self._tplinksmartplug_logger.debug(payload)
+			for plug in self._settings.get(['arrSmartplugs']):
+				self._tplinksmartplug_logger.debug(plug)
+				if plug["event_on_upload"] is True and self._printer.is_closed_or_error():
+					self._tplinksmartplug_logger.debug(f"powering on {plug['ip']} due to {event} event.")
+					response = self.turn_on(plug["ip"])
+					if response["currentState"] == "on":
+						self._tplinksmartplug_logger.debug(f"power on successful for {plug['ip']} attempting connection in {plug.get('autoConnectDelay', '0')} seconds")
+						self._plugin_manager.send_plugin_message(self._identifier, response)
+						if payload.get("path", False) and payload.get("target") == "local" and payload.get("print", False):
+							self._autostart_file = payload.get("path")
 		# Shutdown Event
-		if event == Events.SHUTDOWN and self._settings.get_boolean(["event_on_shutdown_monitoring"]):
+		if event == Events.SHUTDOWN and any(map(lambda plug_check: plug_check.get("event_on_shutdown", False) is True, self._settings.get(["arrSmartplugs"]))) is True:
 			for plug in self._settings.get(['arrSmartplugs']):
 				if plug["event_on_shutdown"] is True:
-					self._tplinksmartplug_logger.debug("powering off %s due to shutdown event." % plug["ip"])
+					self._tplinksmartplug_logger.debug(f"powering off {plug['ip']} due to shutdown event.")
 					self.turn_off(plug["ip"])
 
-	##~~ Idle Timeout
+	# ~~ Idle Timeout
 
 	def _start_idle_timer(self):
 		self._stop_idle_timer()
@@ -918,7 +897,8 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 				self._idleTimer.reset()
 			else:
 				raise Exception()
-		except:
+		except Exception as e:
+			self._tplinksmartplug_logger.error(f"idle timer exception: {e}")
 			self._start_idle_timer()
 
 	def _idle_poweroff(self):
@@ -950,11 +930,15 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 				if self._printer.is_printing() or self._printer.is_paused():
 					self._tplinksmartplug_logger.debug("Aborted power off due to print activity.")
 					return
+				if self._printer.is_closed_or_error() and self._settings.get_boolean(["idleBypassDisconnected"]):
+					self._tplinksmartplug_logger.debug("Aborted power off due to serial disconnect.")
+					self._reset_idle_timer()
+					return
 				self._timer_start()
 		else:
 			self._tplinksmartplug_logger.debug("Aborted power off due to activity.")
 
-	##~~ Timelapse Monitoring
+	# ~~ Timelapse Monitoring
 
 	def _wait_for_timelapse(self):
 		self._waitForTimelapse = True
@@ -971,7 +955,7 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 			self._tplinksmartplug_logger.debug("Waiting for timelapse before shutting off power...")
 			time.sleep(5)
 
-	##~~ Temperature Cooldown
+	# ~~ Temperature Cooldown
 
 	def _wait_for_heaters(self):
 		self._waitForHeaters = True
@@ -991,12 +975,12 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 				continue
 
 			if temp != 0:
-				self._tplinksmartplug_logger.debug("Turning off heater: %s" % heater)
+				self._tplinksmartplug_logger.debug(f"Turning off heater: {heater}")
 				self._skipIdleTimer = True
 				self._printer.set_temperature(heater, 0)
 				self._skipIdleTimer = False
 			else:
-				self._tplinksmartplug_logger.debug("Heater %s already off." % heater)
+				self._tplinksmartplug_logger.debug(f"Heater {heater} already off.")
 
 		while True:
 			if not self._waitForHeaters:
@@ -1021,7 +1005,7 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 					# not a float for some reason, skip it
 					continue
 
-				self._tplinksmartplug_logger.debug("Heater %s = %sC" % (heater, temp))
+				self._tplinksmartplug_logger.debug(f"Heater {heater} = {temp}C")
 				if temp > self.idleTimeoutWaitTemp:
 					heaters_above_waittemp.append(heater)
 
@@ -1036,7 +1020,7 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 				"Waiting for heaters(%s) before shutting power off..." % ', '.join(heaters_above_waittemp))
 			time.sleep(5)
 
-	##~~ Abort Power Off Timer
+	# ~~ Abort Power Off Timer
 
 	def _timer_start(self):
 		if self._abort_timer is not None:
@@ -1070,26 +1054,137 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 				self._plugin_manager.send_plugin_message(self._identifier, response)
 		self._stop_idle_timer()
 
-	##~~ Utilities
+	# ~~ Utilities
 
-	def _get_device_id(self, plugip):
-		response = self._settings.get([plugip])
-		if not response:
-			check_status_cmnd = dict(system=dict(get_sysinfo=dict()))
-			plug_ip = plugip.split("/")
-			self._tplinksmartplug_logger.debug(check_status_cmnd)
-			plug_data = self.sendCommand(check_status_cmnd, plug_ip[0])
-			if len(plug_ip) == 2:
-				response = self.deep_get(plug_data, ["system", "get_sysinfo", "children"], default=False)
-				if response:
-					response = response[int(plug_ip[1]) - 1]["id"]
-			else:
-				response = self.deep_get(response, ["system", "get_sysinfo", "deviceId"])
-			if response:
-				self._settings.set([plugip], response)
-				self._settings.save()
-		self._tplinksmartplug_logger.debug("get_device_id response: %s" % response)
-		return response
+	def rgb2hsv(self, r, g, b):
+		r, g, b = r/255.0, g/255.0, b/255.0
+		return_val = dict()
+		mx = max(r, g, b)
+		mn = min(r, g, b)
+		df = mx-mn
+		if mx == mn:
+			return_val["hue"] = 0
+		elif mx == r:
+			return_val["hue"] = (60 * ((g-b)/df) + 360) % 360
+		elif mx == g:
+			return_val["hue"] = (60 * ((b-r)/df) + 120) % 360
+		elif mx == b:
+			return_val["hue"] = (60 * ((r-g)/df) + 240) % 360
+		if mx == 0:
+			return_val["saturation"] = 0
+		else:
+			return_val["saturation"] = df/mx * 100
+		return_val["value"] = mx
+		return return_val
+
+	def _account_for_plug(self, plug):
+		accounts = self._settings.get(["tapoCredentials"]) or {}
+		account = accounts.get((plug or {}).get("tapoCredentialId"))
+		if account is not None:
+			return account
+		username, password = self._settings.get(["username"]), self._settings.get(["password"])
+		return {"username": username, "password": password} if username or password else None
+
+	def _run_device_task(self, coroutine):
+		async def bounded():
+			return await asyncio.wait_for(coroutine, 20)
+		future = self.worker.run_coroutine_threadsafe(bounded())
+		try:
+			return future.result(timeout=21)
+		except Exception:
+			future.cancel()
+			raise
+
+	def get_device_config(self, plugip: str):
+		configs = self._settings.get(["device_configs"]) or {}
+		config = copy.deepcopy(configs.get(plugip))
+		plug = self.plug_search(self._settings.get(["arrSmartplugs"]), "ip", plugip)
+		account = self._account_for_plug(plug)
+		if not config:
+			device = self._run_device_task(Discover.discover_single(plugip.split("/")[0],
+				username=(account or {}).get("username"), password=(account or {}).get("password")))
+			config = device.config.to_dict()
+			config.pop("credentials", None)
+			configs[plugip] = config
+			self._settings.set(["device_configs"], configs)
+			self._settings.save()
+		config = copy.deepcopy(config)
+		if account:
+			config.pop("credentials_hash", None)
+			config["credentials"] = account
+		return config
+
+	async def update_device(self, dev):
+		try:
+			await dev.update()
+			self._tplinksmartplug_logger.debug(f"found device {dev.alias} (model: {dev.model})")
+		except Exception as e:
+			self._tplinksmartplug_logger.debug(f"Unable to get device_config for {dev.host}: {e}")
+			self._tplinksmartplug_logger.debug(f"Unable to get device_config for {dev.host}: {e}")
+
+	async def discover_devices(self, username=None, password=None):
+		devices_mac = {}
+		found_devices = await Discover.discover(on_discovered=self.update_device, username=username, password=password)
+		for dev in found_devices.values():
+			devices_mac[dev.mac] = {'alias': dev.alias, 'host':  dev.host, 'mac': dev.mac, 'model': dev.model, 'state': 'on' if dev.is_on else 'off'}
+		return devices_mac
+
+	async def connect_device(self, config_dict):
+		if "credentials" in config_dict and is_version_compatible(kasa_version, "<0.8.0"):
+			config_dict["credentials"] = Credentials(**config_dict["credentials"])
+		device = await Device.connect(config=Device.Config.from_dict(config_dict))
+		await device.update()
+		return device
+
+	async def set_device_led(self, device, led_values, set_color=False) -> Optional[Device]:
+		try:
+			self._tplinksmartplug_logger.debug(f"Setting led from values: {led_values}")
+			light = device.modules[Module.Light]
+			if light:
+				if not device.is_on and led_values["LEDOn"]:  # turn light on if off
+					await device.turn_on()
+				elif device.is_on and not led_values["LEDOn"]:
+					await device.turn_off()
+					await device.update()
+					return device
+				if "hsv" in device.features and set_color:
+					hsv_values = self.rgb2hsv(led_values["LEDRed"], led_values["LEDGreen"], led_values["LEDBlue"])
+					self._tplinksmartplug_logger.debug(f"Setting hsv values: {hsv_values}")
+					await light.set_hsv(int(hsv_values["hue"]), int(hsv_values["saturation"]), int(hsv_values["value"]))
+				if light.brightness != int(led_values["LEDBrightness"]):
+					await light.set_brightness(int(led_values["LEDBrightness"]))
+				await device.update()
+		except Exception as e:
+			self._tplinksmartplug_logger.error(f"Error connecting to device: {e}")
+		return device
+
+	def get_device(self, plugip: str):
+		plug = self.plug_search(self._settings.get(["arrSmartplugs"]), "ip", plugip)
+		if plug is None:
+			raise ValueError("The requested plug is not configured.")
+		backend = plug.get("backend", "kasa")
+		if backend == "tapo":
+			from .tapo_device import TapoDevice
+			from .tapo_transport import TapoTransport
+			with self._tapo_transport_lock:
+				if self._tapo_transport is None:
+					self._tapo_transport = TapoTransport()
+			device = TapoDevice(self._tapo_transport, plug, self._account_for_plug(plug))
+			self._run_device_task(device.update())
+			return device
+		if backend != "kasa":
+			raise ValueError("Unknown plug backend. Select python-kasa or Tapo TPAP.")
+		device = self._run_device_task(self.connect_device(self.get_device_config(plugip)))
+		parts = plugip.split("/")
+		if len(parts) == 2 and len(device.children) > 0:
+			device = device.children[int(parts[1]) - 1]
+		return device
+
+	def _device_error(self, plugip, error):
+		from .tapo_transport import TapoError
+		message = str(error) if isinstance(error, TapoError) else "Plug communication failed. Check the device type, reachability and account settings. The command was not retried by the plugin."
+		self._tplinksmartplug_logger.warning("Plug request failed for %s: %s", plugip, message)
+		return dict(ip=plugip, currentState="unknown", emeter=None, error=message)
 
 	def deep_get(self, d, keys, default=None):
 		"""
@@ -1111,107 +1206,14 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 			return self.lookup(dic.get(key, {}), *keys)
 		return dic.get(key)
 
-	def plug_search(self, list, key, value):
-		for item in list:
+	@staticmethod
+	def plug_search(plug_list, key, value):
+		for item in plug_list:
 			if item[key] == value.strip():
 				return item
+		return None
 
-	def encrypt(self, string):
-		key = 171
-		result = b"\0\0\0" + bytes([len(string)])
-		for i in bytes(string.encode('latin-1')):
-			a = key ^ i
-			key = a
-			result += bytes([a])
-		return result
-
-	def decrypt(self, string):
-		key = 171
-		result = b""
-		for i in bytes(string):
-			a = key ^ i
-			key = i
-			result += bytes([a])
-		return result.decode('latin-1')
-
-	def sendCommand(self, cmd, plugip, plug_num=0):
-		configured_ip = "{}/{}".format(plugip, int(plug_num)) if int(plug_num) else plugip
-		plug = self.plug_search(self._settings.get(["arrSmartplugs"]), "ip", configured_ip)
-		backend = (plug or {}).get("backend", "kasa")
-		if backend == "tapo":
-			try:
-				if sys.version_info < (3, 11):
-					raise RuntimeError("Tapo support requires Python 3.11 or newer.")
-				from .tapo_transport import TapoTransport
-				with self._tapo_transport_lock:
-					if self._tapo_transport is None:
-						self._tapo_transport = TapoTransport()
-				accounts = self._settings.get(["tapoCredentials"]) or {}
-				account = accounts.get(plug.get("tapoCredentialId")) if isinstance(accounts, dict) else None
-				if account is not None:
-					return self._tapo_transport.send(cmd, plug, credentials=account)
-				return self._tapo_transport.send(cmd, plug)
-			except Exception as exc:
-				# Only our own error messages are safe to expose, not third-party exceptions.
-				from .tapo_errors import safe_tapo_error
-				message = safe_tapo_error(exc, sys.version_info)
-				self._tplinksmartplug_logger.warning("Tapo request failed: %s", message)
-				return {"system": {"get_sysinfo": {"relay_state": 3}, "set_relay_state": {"err_code": -1}},
-					"emeter": {"err_code": True}, "error": message}
-		if backend != "kasa":
-			return {"system": {"get_sysinfo": {"relay_state": 3}, "set_relay_state": {"err_code": -1}},
-				"error": "Unknown plug backend. Select Kasa or Tapo."}
-		commands = {'info': '{"system":{"get_sysinfo":{}}}',
-					'on': '{"system":{"set_relay_state":{"state":1}}}',
-					'off': '{"system":{"set_relay_state":{"state":0}}}',
-					'cloudinfo': '{"cnCloud":{"get_info":{}}}',
-					'wlanscan': '{"netif":{"get_scaninfo":{"refresh":0}}}',
-					'time': '{"time":{"get_time":{}}}',
-					'schedule': '{"schedule":{"get_rules":{}}}',
-					'countdown': '{"count_down":{"get_rules":{}}}',
-					'antitheft': '{"anti_theft":{"get_rules":{}}}',
-					'reboot': '{"system":{"reboot":{"delay":1}}}',
-					'reset': '{"system":{"reset":{"delay":1}}}'
-					}
-		if re.search('/\d+$', plugip):
-			self._tplinksmartplug_logger.exception("Internal error passing unsplit %s", plugip)
-		# try to connect via ip address
-		try:
-			socket.inet_aton(plugip)
-			ip = plugip
-			self._tplinksmartplug_logger.debug("IP %s is valid." % plugip)
-		except socket.error:
-			# try to convert hostname to ip
-			self._tplinksmartplug_logger.debug("Invalid ip %s trying hostname." % plugip)
-			try:
-				ip = socket.gethostbyname(plugip)
-				self._tplinksmartplug_logger.debug("Hostname %s is valid." % plugip)
-			except (socket.herror, socket.gaierror):
-				self._tplinksmartplug_logger.debug("Invalid hostname %s." % plugip)
-				return {"system": {"get_sysinfo": {"relay_state": 3}}, "emeter": {"err_code": True}}
-
-		if int(plug_num) >= 1:
-			plug_ip_num = "{}/{}".format(plugip, int(plug_num))
-			cmd["context"] = dict(child_ids=[self._get_device_id(plug_ip_num)])
-
-		try:
-			self._tplinksmartplug_logger.debug("Sending command %s to %s" % (cmd, plugip))
-			sock_tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-			sock_tcp.connect((ip, 9999))
-			sock_tcp.send(self.encrypt(json.dumps(cmd)))
-			data = sock_tcp.recv(1024)
-			len_data = unpack('>I', data[0:4])
-			while (len(data) - 4) < len_data[0]:
-				data = data + sock_tcp.recv(1024)
-			sock_tcp.close()
-
-			self._tplinksmartplug_logger.debug(self.decrypt(data))
-			return json.loads(self.decrypt(data[4:]))
-		except socket.error:
-			self._tplinksmartplug_logger.debug("Could not connect to %s." % plugip)
-			return {"system": {"get_sysinfo": {"relay_state": 3}}, "emeter": {"err_code": True}}
-
-	##~~ Gcode processing hook
+	# ~~ Gcode processing hook
 
 	def gcode_turn_off(self, plug):
 		if plug["ip"] in self.active_timers["off"]:
@@ -1226,7 +1228,6 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 			chk = self.turn_off(plug["ip"])
 			self._plugin_manager.send_plugin_message(self._identifier, chk)
 
-
 	def gcode_turn_on(self, plug):
 		if plug["ip"] in self.active_timers["on"]:
 			self.active_timers["on"][plug["ip"]].cancel()
@@ -1235,17 +1236,17 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 		chk = self.turn_on(plug["ip"])
 		self._plugin_manager.send_plugin_message(self._identifier, chk)
 
-	def processGCODE(self, comm_instance, phase, cmd, cmd_type, gcode, *args, **kwargs):
+	def process_gcode(self, comm_instance, phase, cmd, cmd_type, gcode, *args, **kwargs):
 		if self.powerOffWhenIdle and not (gcode in self._idleIgnoreCommandsArray):
 			self._waitForHeaters = False
 			self._reset_idle_timer()
 
-		if gcode not in ["M80", "M81"]:
+		if gcode not in ["M80", "M81", "M150", "M355"]:
 			return
 
 		if gcode == "M80":
 			plugip = re.sub(r'^M80\s?', '', cmd)
-			self._tplinksmartplug_logger.debug("Received M80 command, attempting power on of %s." % plugip)
+			self._tplinksmartplug_logger.debug(f"Received M80 command, attempting power on of {plugip}.")
 			plug = self.plug_search(self._settings.get(["arrSmartplugs"]), "ip", plugip)
 			self._tplinksmartplug_logger.debug(plug)
 			if plug and plug["gcodeEnabled"]:
@@ -1253,9 +1254,9 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 				t.daemon = True
 				t.start()
 			return
-		if gcode == "M81":
+		elif gcode == "M81":
 			plugip = re.sub(r'^M81\s?', '', cmd)
-			self._tplinksmartplug_logger.debug("Received M81 command, attempting power off of %s." % plugip)
+			self._tplinksmartplug_logger.debug(f"Received M81 command, attempting power off of {plugip}.")
 			plug = self.plug_search(self._settings.get(["arrSmartplugs"]), "ip", plugip)
 			self._tplinksmartplug_logger.debug(plug)
 			if plug and plug["gcodeEnabled"]:
@@ -1263,50 +1264,86 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 				t.daemon = True
 				t.start()
 			return
+		elif gcode in ["M150", "M355"] and any(map(lambda plug_check: plug_check.get("receives_led_commands", False) is True, self._settings.get(["arrSmartplugs"]))):
+			for led_device in self._settings.get(["arrSmartplugs"]):
+				if led_device["receives_led_commands"]:
+					device = self.get_device(led_device["ip"])
+					if device:
+						led_values = {'LEDRed': 255, 'LEDBlue': 255, 'LEDGreen': 255, 'LEDWhite': 255, 'LEDBrightness': 100, 'LEDOn': True}
+						cmd_split = cmd.upper().split()
+						for i in cmd_split:
+							first_char = str(i[0].upper())
+							led_data = str(i[1:].strip())
+							if not led_data.isdigit() and first_char != 'I':
+								self._tplinksmartplug_logger.debug(led_data)
+								return
 
-	def processAtCommand(self, comm_instance, phase, command, parameters, tags=None, *args, **kwargs):
+							if first_char == 'M':
+								continue
+							elif first_char == 'R':
+								led_values['LEDRed'] = int(led_data)
+							elif first_char == 'B':
+								led_values['LEDBlue'] = int(led_data)
+							elif first_char == 'G' or first_char == 'U':
+								led_values['LEDGreen'] = int(led_data)
+							elif first_char == "W":
+								led_values['LEDWhite'] = int(led_data)
+							elif first_char == "P":
+								led_values['LEDBrightness'] = int(float(led_data) / 255 * 100)
+							elif first_char == "S":
+								led_values['LEDOn'] = bool(int(led_data))
+							else:
+								self._tplinksmartplug_logger.debug(led_data)
+
+						self._tplinksmartplug_logger.debug(f"M150 command, attempting color change of {led_device['ip']}.")
+						self.worker.run_coroutine_threadsafe(self.set_device_led(device, led_values, set_color=(gcode == "M150")))
+						chk = self.check_status(led_device["ip"])
+						self._plugin_manager.send_plugin_message(self._identifier, chk)
+			return
+
+	def process_at_command(self, comm_instance, phase, command, parameters, tags=None, *args, **kwargs):
 		if command == "TPLINKON":
 			plugip = parameters
-			self._tplinksmartplug_logger.debug("Received TPLINKON command, attempting power on of %s." % plugip)
+			self._tplinksmartplug_logger.debug(f"Received TPLINKON command, attempting power on of {plugip}.")
 			plug = self.plug_search(self._settings.get(["arrSmartplugs"]), "ip", plugip)
 			self._tplinksmartplug_logger.debug(plug)
 			if plug and plug["gcodeEnabled"]:
 				if plugip in self.active_timers["off"]:
 					self.active_timers["off"][plugip].cancel()
 					del self.active_timers["off"][plugip]
-				self.active_timers["on"][plugip] = threading.Timer(int(plug["gcodeOnDelay"]), self.gcode_turn_on, [plug])
+				self.active_timers["on"][plugip] = threading.Timer(int(plug["gcodeOnDelay"]), self.gcode_turn_on,
+																   [plug])
 				self.active_timers["on"][plugip].daemon = True
 				self.active_timers["on"][plugip].start()
-			return None
-		if command == "TPLINKOFF":
+		elif command == "TPLINKOFF":
 			plugip = parameters
-			self._tplinksmartplug_logger.debug("Received TPLINKOFF command, attempting power off of %s." % plugip)
+			self._tplinksmartplug_logger.debug(f"Received TPLINKOFF command, attempting power off of {plugip}.")
 			plug = self.plug_search(self._settings.get(["arrSmartplugs"]), "ip", plugip)
 			self._tplinksmartplug_logger.debug(plug)
 			if plug and plug["gcodeEnabled"]:
 				if plugip in self.active_timers["on"]:
 					self.active_timers["on"][plugip].cancel()
 					del self.active_timers["on"][plugip]
-				self.active_timers["off"][plugip] = threading.Timer(int(plug["gcodeOffDelay"]), self.gcode_turn_off, [plug])
+				self.active_timers["off"][plugip] = threading.Timer(int(plug["gcodeOffDelay"]), self.gcode_turn_off,
+																	[plug])
 				self.active_timers["off"][plugip].daemon = True
 				self.active_timers["off"][plugip].start()
-			return None
-		if command == 'TPLINKIDLEON':
-			self.powerOffWhenIdle = True
-			self._reset_idle_timer()
-		if command == 'TPLINKIDLEOFF':
-			self.powerOffWhenIdle = False
-			self._stop_idle_timer()
-			if self._abort_timer is not None:
-				self._abort_timer.cancel()
-				self._abort_timer = None
-			self._timeout_value = None
-		if command in ["TPLINKIDLEON", "TPLINKIDLEOFF"]:
+		elif command in ["TPLINKIDLEON", "TPLINKIDLEOFF"]:
+			if command == 'TPLINKIDLEON':
+				self.powerOffWhenIdle = True
+				self._reset_idle_timer()
+			elif command == 'TPLINKIDLEOFF':
+				self.powerOffWhenIdle = False
+				self._stop_idle_timer()
+				if self._abort_timer is not None:
+					self._abort_timer.cancel()
+					self._abort_timer = None
+				self._timeout_value = None
 			self._plugin_manager.send_plugin_message(self._identifier,
 													 dict(powerOffWhenIdle=self.powerOffWhenIdle, type="timeout",
 														  timeout_value=self._timeout_value))
 
-	##~~ Temperatures received hook
+	# ~~ Temperatures received hook
 
 	def check_temps(self, parsed_temps):
 		thermal_runaway_triggered = False
@@ -1317,9 +1354,9 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 			if k.startswith("T") and v[0] > int(self._settings.get(["thermal_runaway_max_extruder"])):
 				self._tplinksmartplug_logger.debug("Extruder max temp reached, shutting off plugs.")
 				thermal_runaway_triggered = True
-			if thermal_runaway_triggered == True:
+			if thermal_runaway_triggered:
 				for plug in self._settings.get(['arrSmartplugs']):
-					if plug["thermal_runaway"] == True:
+					if plug["thermal_runaway"]:
 						response = self.turn_off(plug["ip"])
 						if response["currentState"] == "off":
 							self._plugin_manager.send_plugin_message(self._identifier, response)
@@ -1332,9 +1369,10 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 			t.start()
 		return parsed_temps
 
-	##~~ Access Permissions Hook
+	# ~~ Access Permissions Hook
 
-	def get_additional_permissions(self, *args, **kwargs):
+	@staticmethod
+	def get_additional_permissions(*args, **kwargs):
 		return [
 			dict(key="CONTROL",
 				 name="Control Plugs",
@@ -1344,7 +1382,7 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 				 default_groups=[ADMIN_GROUP])
 		]
 
-	##~~ Softwareupdate hook
+	# ~~ Softwareupdate hook
 
 	def get_update_information(self):
 		return dict(
@@ -1361,8 +1399,8 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 				prerelease_branches=[
 					dict(
 						name="Release Candidate",
-						branch="rc",
-						comittish=["rc", "master"],
+						branch="feature/tapo-p110-v2",
+						comittish=["feature/tapo-p110-v2", "master"],
 					)
 				],
 				pip="https://github.com/MephistoJB/OctoPrint-TPLinkSmartplug/archive/{target_version}.zip"
@@ -1371,7 +1409,7 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 
 
 __plugin_name__ = "TP-Link Smartplug"
-__plugin_pythoncompat__ = ">=2.7,<4"
+__plugin_pythoncompat__ = ">=3.11,<4"
 
 
 def __plugin_load__():
@@ -1380,8 +1418,8 @@ def __plugin_load__():
 
 	global __plugin_hooks__
 	__plugin_hooks__ = {
-		"octoprint.comm.protocol.gcode.queuing": __plugin_implementation__.processGCODE,
-		"octoprint.comm.protocol.atcommand.sending": __plugin_implementation__.processAtCommand,
+		"octoprint.comm.protocol.gcode.queuing": __plugin_implementation__.process_gcode,
+		"octoprint.comm.protocol.atcommand.sending": __plugin_implementation__.process_at_command,
 		"octoprint.comm.protocol.temperatures.received": __plugin_implementation__.monitor_temperatures,
 		"octoprint.access.permissions": __plugin_implementation__.get_additional_permissions,
 		"octoprint.plugin.softwareupdate.check_config": __plugin_implementation__.get_update_information,

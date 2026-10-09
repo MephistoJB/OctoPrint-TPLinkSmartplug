@@ -8,3 +8,8 @@
 
 .
 uptime
+octoprint
+flask
+setuptools
+python-kasa>=0.11.0.1,<0.12
+tapo==0.11.1

@@ -1,9 +1,11 @@
-import json
-from unittest.mock import Mock, patch
+import copy
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
 from octoprint_tplinksmartplug import tplinksmartplugPlugin
+from octoprint_tplinksmartplug.tapo_transport import TapoError
+from octoprint_tplinksmartplug.tapo_device import TapoDevice
 
 STATUS = {"system": {"get_sysinfo": {}}}
 ON = {"system": {"set_relay_state": {"state": 1}}}
@@ -15,6 +17,9 @@ def plugin():
     p._settings = Mock()
     p._printer = Mock()
     p._plugin_manager = Mock()
+    config = p.get_settings_defaults()
+    p._settings.get.side_effect = lambda path: config.get(path[0])
+    p._test_config = config
     yield p
     p.on_shutdown()
 
@@ -23,116 +28,144 @@ def configure(plugin, **overrides):
     plug = dict(ip="192.0.2.1", backend="tapo", useCountdownRules=False,
                 autoConnect=False, autoDisconnect=False, gcodeCmdOn=False,
                 gcodeCmdOff=False, sysCmdOn=False, sysCmdOff=False,
-                automaticShutdownEnabled=False)
+                automaticShutdownEnabled=False, event_on_startup=False)
     plug.update(overrides)
-    plugin._settings.get.return_value = [plug]
+    plugin._test_config['arrSmartplugs'] = [plug]
     return plug
 
 
-def test_kasa_remains_default_and_uses_original_wire_protocol(plugin):
-    configure(plugin, backend="kasa")
-    socket = Mock()
-    response = plugin.encrypt(json.dumps({"system": {"get_sysinfo": {"relay_state": 1}}}))
-    socket.recv.return_value = response
-    with patch("octoprint_tplinksmartplug.socket.socket", return_value=socket):
-        result = plugin.sendCommand(STATUS, "192.0.2.1")
-    socket.connect.assert_called_once_with(("192.0.2.1", 9999))
-    socket.send.assert_called_once_with(plugin.encrypt(json.dumps(STATUS)))
-    assert result["system"]["get_sysinfo"]["relay_state"] == 1
+def tapo_transport(plugin, state=True):
+    adapter = Mock()
+    def send(command, plug, credentials=None):
+        nonlocal state
+        if command == STATUS:
+            return {"system": {"get_sysinfo": {"relay_state": int(state)}}}
+        state = command == ON
+        return {"system": {"set_relay_state": {"err_code": 0}}}
+    adapter.send.side_effect = send
+    plugin._tapo_transport = adapter
+    return adapter
+
+
+@pytest.mark.parametrize('backend', ['kasa', None])
+def test_normal_and_legacy_plugs_use_upstream_python_kasa(plugin, backend):
+    plug = configure(plugin, backend=backend)
+    if backend is None: del plug['backend']
+    device = Mock()
+    with patch.object(plugin, 'get_device_config', return_value={'host':plug['ip']}), patch.object(plugin, 'connect_device', new=AsyncMock(return_value=device)) as connect:
+        assert plugin.get_device(plug['ip']) is device
+    connect.assert_awaited_once_with({'host':plug['ip']})
     assert plugin._tapo_transport is None
 
 
-def test_existing_plug_without_backend_remains_kasa(plugin):
+def test_tpap_uses_only_the_retained_adapter(plugin):
     plug = configure(plugin)
-    del plug["backend"]
-    with patch("octoprint_tplinksmartplug.socket.socket") as socket:
-        socket.return_value.recv.return_value = plugin.encrypt(json.dumps({"system": {"get_sysinfo": {"relay_state": 0}}}))
-        assert plugin.sendCommand(STATUS, "192.0.2.1")["system"]["get_sysinfo"]["relay_state"] == 0
-    socket.return_value.connect.assert_called_once_with(("192.0.2.1", 9999))
+    adapter = tapo_transport(plugin)
+    with patch.object(plugin, 'get_device_config') as config:
+        device = plugin.get_device(plug['ip'])
+    assert isinstance(device, TapoDevice)
+    assert device.is_on is True
+    config.assert_not_called()
+    adapter.send.assert_called_once_with(STATUS, plug, credentials=None)
 
 
-def test_tapo_dispatch_never_uses_kasa_socket(plugin):
+@pytest.mark.parametrize('method,command,state', [('turn_on', ON, 'on'), ('turn_off', OFF, 'off')])
+def test_tpap_switches_through_common_v2_device_path(plugin, method, command, state):
     plug = configure(plugin)
-    adapter = Mock()
-    plugin._tapo_transport = adapter
-    adapter.send.return_value = {"system": {"get_sysinfo": {"relay_state": 1}}}
-    with patch("octoprint_tplinksmartplug.socket.socket") as socket:
-        assert plugin.sendCommand(STATUS, plug["ip"]) == adapter.send.return_value
-    socket.assert_not_called()
-    adapter.send.assert_called_once_with(STATUS, plug)
-
-
-@pytest.mark.parametrize("method", ["turn_on", "turn_off"])
-def test_tapo_device_timers_are_blocked_before_any_side_effect(plugin, method):
-    plug = configure(plugin, useCountdownRules=True, autoDisconnect=True, sysCmdOff=True)
-    with patch.object(plugin, "sendCommand") as send:
-        result = getattr(plugin, method)(plug["ip"])
-    assert result["currentState"] == "unknown"
-    assert "countdown timers" in result["error"]
-    send.assert_not_called()
+    adapter = tapo_transport(plugin, state=method != 'turn_on')
+    result = getattr(plugin,method)(plug['ip'])
+    assert result == {'ip':plug['ip'], 'currentState':state, 'emeter':None}
+    writes = [call for call in adapter.send.call_args_list if call.args[0] != STATUS]
+    assert len(writes) == 1
+    assert writes[0].args[0] == command
     assert not plugin._printer.mock_calls
 
 
-@pytest.mark.parametrize("method,command", [("turn_on", ON), ("turn_off", OFF)])
-def test_failed_tapo_write_does_not_get_reported_as_successful_read(plugin, method, command):
+@pytest.mark.parametrize('backend', ['kasa','tapo'])
+@pytest.mark.parametrize('method', ['turn_on','turn_off'])
+def test_removed_timers_never_silently_become_immediate_writes(plugin, backend, method):
+    plug = configure(plugin, backend=backend, useCountdownRules=True, autoDisconnect=True, sysCmdOff=True)
+    with patch.object(plugin,'get_device') as get_device:
+        result = getattr(plugin,method)(plug['ip'])
+    assert result['currentState'] == 'unknown'
+    assert 'countdown timers' in result['error']
+    get_device.assert_not_called()
+    assert not plugin._printer.mock_calls
+
+
+@pytest.mark.parametrize('method', ['turn_on','turn_off'])
+def test_failed_write_is_never_reported_as_successful_read(plugin, method):
     plug = configure(plugin)
-    with patch.object(plugin, "sendCommand", return_value={"system": {"set_relay_state": {"err_code": -1}}}) as send, patch.object(plugin, "check_status") as status:
-        result = getattr(plugin, method)(plug["ip"])
-    assert result["currentState"] == "unknown"
-    assert "switching failed" in result["error"]
-    send.assert_called_once_with(command, plug["ip"], 0)
+    adapter = tapo_transport(plugin)
+    original = adapter.send.side_effect
+    def send(command, *args, **kwargs):
+        if command != STATUS: raise TapoError('Tapo communication failed; the command was not retried.')
+        return original(command, *args, **kwargs)
+    adapter.send.side_effect = send
+    with patch.object(plugin,'check_status') as status:
+        result = getattr(plugin,method)(plug['ip'])
+    assert result['currentState'] == 'unknown'
+    assert 'not retried' in result['error']
+    assert adapter.send.call_count == 2 # one preflight read and one failed write
     status.assert_not_called()
-    assert not plugin._printer.mock_calls
 
 
-@pytest.mark.parametrize("relay,state", [(1, "on"), (0, "off")])
-def test_tapo_status_maps_to_existing_frontend_without_energy_database(plugin, relay, state):
-    plug = configure(plugin)
-    with patch.object(plugin, "sendCommand", return_value={"system": {"get_sysinfo": {"relay_state": relay, "feature": "", "on_time": 10}}}) as send:
-        result = plugin.check_status(plug["ip"])
-    assert result == {"currentState": state, "emeter": None, "ip": plug["ip"]}
-    send.assert_called_once()
-
-
-def test_tapo_status_error_is_available_to_frontend(plugin):
-    plug = configure(plugin)
-    with patch.object(plugin, "sendCommand", return_value={"system": {"get_sysinfo": {"relay_state": 3}}, "error": "Safe error"}):
-        result = plugin.check_status(plug["ip"])
-    assert result["currentState"] == "unknown"
-    assert result["error"] == "Safe error"
-
-
-def test_migration_preserves_existing_plug_and_automations(plugin):
-    plug = {"ip": "192.0.2.5", "event_on_startup": True, "automaticShutdownEnabled": False}
-    plugin._settings.get.return_value = [plug]
-    plugin.on_settings_migrate(17, 16)
-    assert plugin.get_settings_version() == 18
-    import uuid
-    uuid.UUID(plug.pop("tapoCredentialId"))
-    assert plug == {"ip": "192.0.2.5", "event_on_startup": True, "automaticShutdownEnabled": False,
-                    "backend": "kasa", "tapoUsernameEnv": "TAPO_USERNAME", "tapoPasswordEnv": "TAPO_PASSWORD"}
-    assert not plugin._printer.mock_calls
-
-
-def test_unknown_backend_does_not_switch_any_device(plugin):
-    configure(plugin, backend="typo")
-    with patch("octoprint_tplinksmartplug.socket.socket") as socket:
-        result = plugin.sendCommand(ON, "192.0.2.1")
-    assert result["system"]["set_relay_state"]["err_code"] == -1
-    socket.assert_not_called()
-
-
-def test_exception_details_never_reach_logs_or_api(plugin, caplog):
-    configure(plugin)
+def test_failed_authentication_precedes_printer_or_system_effects(plugin):
+    plug = configure(plugin, autoDisconnect=True, gcodeCmdOff=True, gcodeRunCmdOff='M104 S0', sysCmdOff=True)
     plugin._tapo_transport = Mock()
-    plugin._tapo_transport.send.side_effect = RuntimeError("private-session-password")
-    result = plugin.sendCommand(ON, "192.0.2.1")
-    assert "private-session-password" not in str(result)
-    assert "private-session-password" not in caplog.text
+    plugin._tapo_transport.send.side_effect = TapoError('Tapo authentication failed.')
+    with patch('octoprint_tplinksmartplug.os.system') as system:
+        result = plugin.turn_off(plug['ip'])
+    assert result['currentState'] == 'unknown'
+    assert not plugin._printer.mock_calls
+    system.assert_not_called()
 
 
-def test_fork_update_source_will_not_replace_tapo_support(plugin):
-    plugin._plugin_version = "1.1.0rc1"
-    info = plugin.get_update_information()["tplinksmartplug"]
-    assert info["user"] == "MephistoJB"
-    assert "github.com/MephistoJB/" in info["pip"]
+@pytest.mark.parametrize('relay,state', [(True,'on'),(False,'off')])
+def test_status_has_no_invented_energy_readings(plugin,relay,state):
+    plug=configure(plugin);tapo_transport(plugin,relay)
+    assert plugin.check_status(plug['ip']) == {'ip':plug['ip'],'currentState':state,'emeter':None}
+
+
+def test_exception_details_never_reach_logs_or_api(plugin,caplog):
+    plug=configure(plugin);plugin._tapo_transport=Mock()
+    plugin._tapo_transport.send.side_effect=RuntimeError('private-session-password')
+    result=plugin.check_status(plug['ip'])
+    assert result['currentState']=='unknown'
+    assert 'private-session-password' not in str(result)
+    assert 'private-session-password' not in caplog.text
+
+
+def test_unknown_backend_cannot_fall_back_to_other_connection(plugin):
+    plug=configure(plugin,backend='typo')
+    with patch.object(plugin,'get_device_config') as config:
+        result=plugin.turn_on(plug['ip'])
+    assert result['currentState']=='unknown'
+    config.assert_not_called()
+
+
+def test_private_account_overrides_default_for_python_kasa(plugin):
+    plug=configure(plugin,backend='kasa',tapoCredentialId='id')
+    plugin._test_config.update(tapoCredentials={'id':{'username':'test@example.invalid','password':'test-private'}},username='default@example.invalid',password='test-default',device_configs={plug['ip']:{'host':plug['ip'],'credentials_hash':'stale-hash'}})
+    result=plugin.get_device_config(plug['ip'])
+    assert result['credentials']=={'username':'test@example.invalid','password':'test-private'}
+    assert 'credentials_hash' not in result
+    assert 'credentials' not in plugin._test_config['device_configs'][plug['ip']]
+
+
+def test_newly_discovered_config_never_persists_password(plugin):
+    plug=configure(plugin,backend='kasa')
+    plugin._test_config.update(username='test@example.invalid',password='test-default')
+    device=Mock();device.config.to_dict.return_value={'host':plug['ip'],'credentials':{'username':'test@example.invalid','password':'test-default'}}
+    with patch('octoprint_tplinksmartplug.Discover.discover_single', new=AsyncMock(return_value=device)):
+        result=plugin.get_device_config(plug['ip'])
+    stored=plugin._settings.set.call_args.args[1]
+    assert 'credentials' not in stored[plug['ip']]
+    assert result['credentials']['password']=='test-default'
+
+
+def test_fork_update_source_preserves_additional_tpap_support(plugin):
+    plugin._plugin_version='2.0.0rc9'
+    info=plugin.get_update_information()['tplinksmartplug']
+    assert info['user']=='MephistoJB'
+    assert 'github.com/MephistoJB/' in info['pip']
