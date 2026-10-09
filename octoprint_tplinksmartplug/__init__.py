@@ -726,7 +726,12 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 				username = data["username"]
 			if "password" in data and data["password"] != "":
 				password = data["password"]
-			found_devices = self._run_device_task(self.discover_devices(username, password))
+			try:
+				found_devices = self._run_device_task(self.discover_devices(username, password))
+			except Exception:
+				message = "Device discovery failed. Check network reachability and account settings."
+				self._tplinksmartplug_logger.warning(message)
+				return flask.make_response(flask.jsonify(error=message, discovered_devices={}), 502)
 			response = {'discovered_devices': found_devices}
 		else:
 			response = dict(ip="{ip}".format(**data), currentState="unknown")
@@ -1119,8 +1124,7 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 			await dev.update()
 			self._tplinksmartplug_logger.debug(f"found device {dev.alias} (model: {dev.model})")
 		except Exception as e:
-			self._tplinksmartplug_logger.debug(f"Unable to get device_config for {dev.host}: {e}")
-			self._tplinksmartplug_logger.debug(f"Unable to get device_config for {dev.host}: {e}")
+			self._tplinksmartplug_logger.warning("Could not update a discovered device. Check its account settings and reachability.")
 
 	async def discover_devices(self, username=None, password=None):
 		devices_mac = {}
@@ -1155,7 +1159,7 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 					await light.set_brightness(int(led_values["LEDBrightness"]))
 				await device.update()
 		except Exception as e:
-			self._tplinksmartplug_logger.error(f"Error connecting to device: {e}")
+			self._tplinksmartplug_logger.warning("Light update failed. Check the selected device and account settings.")
 		return device
 
 	def get_device(self, plugip: str):

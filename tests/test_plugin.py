@@ -169,3 +169,22 @@ def test_fork_update_source_preserves_additional_tpap_support(plugin):
     info=plugin.get_update_information()['tplinksmartplug']
     assert info['user']=='MephistoJB'
     assert 'github.com/MephistoJB/' in info['pip']
+
+
+def test_discovery_error_never_returns_or_logs_library_exception_details(plugin,caplog):
+    import flask
+    configure(plugin,backend='kasa')
+    app=flask.Flask(__name__)
+    with app.test_request_context(), patch('octoprint_tplinksmartplug.Permissions') as permissions, patch.object(plugin,'discover_devices',new=AsyncMock(side_effect=RuntimeError('private-session-password'))):
+        permissions.PLUGIN_TPLINKSMARTPLUG_CONTROL.can.return_value=True
+        permissions.ADMIN.can.return_value=True
+        response=plugin.on_api_command('discoverDevices',{'username':'','password':''})
+    assert response.status_code==502
+    assert 'private-session-password' not in response.get_data(as_text=True)
+    assert 'private-session-password' not in caplog.text
+
+
+def test_discovered_device_update_does_not_log_account_exception(plugin,caplog):
+    device=Mock();device.update=AsyncMock(side_effect=RuntimeError('private-session-password'))
+    plugin._run_device_task(plugin.update_device(device))
+    assert 'private-session-password' not in caplog.text
