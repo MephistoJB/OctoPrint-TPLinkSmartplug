@@ -2,7 +2,8 @@
 
 This contribution is based on the upstream 2.0 `rc` branch and retains upstream
 release versioning and update sources. Its 2.0 integration has been tested with
-fake devices and an offline browser fixture, but not physically on OctoPi.
+fake devices, an offline browser fixture and a real P110 using TPAP on OctoPi
+(OctoPrint 1.11.8, Python 3.11.2, armv7).
 Migration from the earlier 1.x fork is supported; that version is preserved as the final
 [1.1.0 release](https://github.com/MephistoJB/OctoPrint-TPLinkSmartplug/releases/tag/1.1.0).
 
@@ -90,7 +91,7 @@ The 2.0 worker starts its event loop before accepting tasks and cancels pending
 tasks before closing it. Device operations have bounded waits. Accounts/device
 configuration are injected in memory for normal python-kasa connections.
 
-## Validation and future installation
+## Validation and installation
 
 ```
 python -m pip install OctoPrint uptime 'python-kasa>=0.11.0.1,<0.12' tapo==0.11.1 pytest
@@ -106,8 +107,33 @@ Before a future installation: stop/finish prints, back up the complete OctoPrint
 configuration, review enabled automations, install this branch and restart
 OctoPrint. Enabling startup power-on will power the printer at that restart.
 Then test the actual device, off confirmation, startup, upload and idle actions.
-Those physical 2.0 tests remain outstanding; the passing local tests do not
-replace them.
+The P110 TPAP integration passed these physical checks:
+
+- Installation and migration to settings version 19 preserved plug identity,
+  stored credentials, connection delays and effective automation flags.
+- On/Off, read-back, automatic connection/disconnection, startup power-on and
+  credential persistence across service restarts worked.
+- Sidebar On/Off and confirmation cancel/proceed worked in the real browser.
+  Blank password saves preserved the account; cancelling settings cleared inputs.
+  Passwords/private stores were absent from public APIs and account values were
+  absent from plugin/installation logs.
+- Automatic idle shutdown worked with concurrent status polling: a temporary
+  one-minute idle interval and five-second cancellation window powered off in
+  about 67 seconds. Original 30-minute settings were restored. An initial
+  status/write conflict was fixed with the async gate and covered by regression
+  tests; live timer interval changes now take effect immediately.
+- Upload power-on was checked both disabled and temporarily enabled, using a
+  comment-only file without selecting or printing it. The file was deleted and
+  original flags restored. The final relay state was off and the printer offline.
+
+The automated suite contains 97 tests and passed CI on Python 3.11 and 3.13.
+These checks did not start a print, heat or move the printer. Other Kasa/Tapo
+models and lighting operations have not been physically tested.
+
+For an unreleased PR build, OctoPrint's release-channel switching may offer an
+older upstream release as an update. Temporarily disable only this plugin's
+update check while testing a PR to preserve the tested implementation; re-enable
+it when a published release contains the changes.
 
 Rollback requires reinstalling the 1.1.0 release **and restoring the pre-migration
 configuration backup**. The same plugin identifier is used, so versions cannot be
