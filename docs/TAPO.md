@@ -13,7 +13,7 @@ https://github.com/MephistoJB/OctoPrint-TPLinkSmartplug/archive/refs/heads/featu
 ```
 
 The identifier is unchanged, so this replaces the original plugin rather than
-adding a second controller. Its version is `1.1.0rc3`. Updates point to this fork
+adding a second controller. Its version is `1.1.0`. Updates point to this fork
 so an upstream update cannot remove Tapo support. Plugin installation/activation
 normally requires an OctoPrint restart; development and tests do not.
 
