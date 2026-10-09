@@ -11,6 +11,7 @@ $(function() {
 		self.settings = parameters[0];
 		self.loginState = parameters[1];
 		self.filesViewModel = parameters[2];
+        self.access = parameters[3];
 
         // Hijack the getAdditionalData function and add the custom data
         let oldGetData = self.filesViewModel.getAdditionalData;
@@ -188,9 +189,44 @@ $(function() {
 			sidebar_tab.removeClass('overflow_visible in').addClass('collapse').siblings('div.accordion-heading').children('a.accordion-toggle').addClass('collapsed');
 		}
 
+		self.ensureTapoFields = function(plug) {
+			if (!plug.useCountdownRules) plug.useCountdownRules = ko.observable(false);
+			if (!plug.backend) plug.backend = ko.observable('kasa');
+			if (!plug.tapoUsername) plug.tapoUsername = ko.observable('');
+			if (!plug.tapoPassword) plug.tapoPassword = ko.observable('');
+			if (!plug.tapoPasswordSet) plug.tapoPasswordSet = ko.observable(false);
+			if (!plug.tapoClearCredentials) plug.tapoClearCredentials = ko.observable(false);
+			if (!plug.tapoUsernameEnv) plug.tapoUsernameEnv = ko.observable('TAPO_USERNAME');
+			if (!plug.tapoPasswordEnv) plug.tapoPasswordEnv = ko.observable('TAPO_PASSWORD');
+		};
+
 		self.onBeforeBinding = function() {
+            const config = self.settings.settings.plugins.tplinksmartplug;
+            if (!config.passwordSet) config.passwordSet = ko.observable(false);
+            if (!config.clearDefaultCredentials) config.clearDefaultCredentials = ko.observable(false);
+			ko.utils.arrayForEach(self.settings.settings.plugins.tplinksmartplug.arrSmartplugs(), self.ensureTapoFields);
 			self.arrSmartplugs(self.settings.settings.plugins.tplinksmartplug.arrSmartplugs());
 		}
+
+		self.onSettingsShown = function() {
+			ko.utils.arrayForEach(self.settings.settings.plugins.tplinksmartplug.arrSmartplugs(), self.ensureTapoFields);
+			self.arrSmartplugs(self.settings.settings.plugins.tplinksmartplug.arrSmartplugs());
+		};
+
+		self.onSettingsHidden = function() {
+            const config = self.settings.settings.plugins.tplinksmartplug;
+            if (config.password) config.password('');
+			ko.utils.arrayForEach(self.arrSmartplugs(), function(plug) {
+				if (plug.tapoPassword) plug.tapoPassword('');
+			});
+			if (self.selectedPlug() && self.selectedPlug().tapoPassword) self.selectedPlug().tapoPassword('');
+		};
+
+		self.publicPlugs = function() {
+			var plugs = ko.toJS(self.arrSmartplugs);
+			ko.utils.arrayForEach(plugs, function(plug) { delete plug.tapoPassword; });
+			return plugs;
+		};
 
 		self.onAfterBinding = function() {
 			self.plotted_graph_ip.subscribe(self.plotEnergyData, self);
@@ -224,12 +260,20 @@ $(function() {
 		}
 
 		self.editPlug = function(data) {
+			self.ensureTapoFields(data);
 			self.selectedPlug(data);
 			$("#TPLinkPlugEditor").modal("show");
 		}
 
 		self.addPlug = function() {
 			self.selectedPlug({'ip':ko.observable(''),
+								'backend':ko.observable('kasa'),
+								'tapoUsername':ko.observable(''),
+								'tapoPassword':ko.observable(''),
+								'tapoPasswordSet':ko.observable(false),
+								'tapoClearCredentials':ko.observable(false),
+								'tapoUsernameEnv':ko.observable('TAPO_USERNAME'),
+								'tapoPasswordEnv':ko.observable('TAPO_PASSWORD'),
 								'label':ko.observable(''),
 								'icon':ko.observable('icon-bolt'),
 								'displayWarning':ko.observable(true),
@@ -367,6 +411,36 @@ $(function() {
 			}
 		};
 
+        self.plugStateText = function(data) {
+            if (self.processing().indexOf(data.ip()) !== -1) return gettext("Working...");
+            if (data.currentState() === "on") return gettext("On");
+            if (data.currentState() === "off") return gettext("Off");
+            return gettext("Unknown");
+        };
+
+        self.canControlPlug = function(data) {
+            return self.loginState.hasPermission(self.access.permissions.PLUGIN_TPLINKSMARTPLUG_CONTROL) &&
+                self.processing().indexOf(data.ip()) === -1;
+        };
+
+        self.sidebarTurnOn = function(data) {
+            if (!self.canControlPlug(data)) return;
+            self.processing.push(data.ip());
+            self.turnOn(data);
+        };
+
+        self.sidebarTurnOff = function(data) {
+            if (!self.canControlPlug(data)) return;
+            self.turnOff(data);
+        };
+
+        self.requestFailed = function(ip) {
+            self.processing.remove(ip);
+            new PNotify({title: gettext("TP-Link Smartplug"),
+                text: gettext("The plug request failed. Refresh its status before trying again."),
+                type: "error", text_escape: true, hide: true});
+        };
+
 		self.toggleRelay = function(data) {
 			self.processing.push(data.ip());
 			switch(data.currentState()){
@@ -386,6 +460,7 @@ $(function() {
 		}
 
 		self.sendTurnOn = function(data) {
+            var argumentsPlug = data;
 			$.ajax({
 				url: API_BASEURL + "plugin/tplinksmartplug",
 				type: "POST",
@@ -398,7 +473,7 @@ $(function() {
 			}).done(function(data){
 					self.updateDictionary(data);
 					self.processing.remove(data.ip);
-				});
+				}).fail(function() { self.requestFailed(ko.toJS(argumentsPlug.ip)); });
 		};
 
 		self.turnOff = function(data) {
@@ -412,6 +487,8 @@ $(function() {
 		};
 
 		self.sendTurnOff = function(data) {
+            var argumentsPlug = data;
+            if (self.processing().indexOf(data.ip()) === -1) self.processing.push(data.ip());
 			$.ajax({
 			url: API_BASEURL + "plugin/tplinksmartplug",
 			type: "POST",
@@ -424,7 +501,7 @@ $(function() {
 			}).done(function(data){
 					self.updateDictionary(data);
 					self.processing.remove(data.ip);
-				});
+				}).fail(function() { self.requestFailed(ko.toJS(argumentsPlug.ip)); });
 		}
 
 		self.getDefaultBackground = function() {
@@ -617,6 +694,11 @@ $(function() {
 		}
 
 		self.updateDictionary = function(data){
+			if (data.error) {
+				new PNotify({title: gettext("TP-Link Smartplug"), text: data.error,
+					type: "error", text_escape: true, hide: true});
+			}
+
 			ko.utils.arrayForEach(self.arrSmartplugs(),function(item){
 					if(item.ip() == data.ip) {
 						item.currentState(data.currentState);
@@ -628,12 +710,14 @@ $(function() {
 							if(data.ip == self.plotted_graph_ip() && window.location.href.indexOf('tplinksmartplug') > 0){
 								self.plotEnergyData();
 							}
+						} else if (item.backend && item.backend() === 'tapo') {
+							item.emeter.get_realtime = {};
 						}
 						self.processing.remove(data.ip);
 					}
 				});
 				//self.dictSmartplugs.removeAll();
-				self.dictSmartplugs.pushAll(ko.toJS(self.arrSmartplugs),'ip');
+				self.dictSmartplugs.pushAll(self.publicPlugs(),'ip');
 			}
 
 		self.checkStatus = function(plugIP) {
@@ -643,7 +727,7 @@ $(function() {
 				dataType: "json",
 				data: {checkStatus:plugIP},
 				contentType: "application/json; charset=UTF-8"
-			}).done(self.updateDictionary);
+			}).done(self.updateDictionary).fail(function() { self.requestFailed(plugIP); });
 		};
 
 		self.checkStatuses = function() {
@@ -658,7 +742,7 @@ $(function() {
 
 	OCTOPRINT_VIEWMODELS.push([
 		tplinksmartplugViewModel,
-		["settingsViewModel","loginStateViewModel", "filesViewModel"],
+		["settingsViewModel","loginStateViewModel", "filesViewModel", "accessViewModel"],
 		["#navbar_plugin_tplinksmartplug","#settings_plugin_tplinksmartplug","#sidebar_plugin_tplinksmartplug_wrapper","#tab_plugin_tplinksmartplug","#tab_plugin_tplinksmartplug_link"]
 	]);
 });

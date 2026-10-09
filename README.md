@@ -88,3 +88,13 @@ I, jneilliii, programmed this plugin for fun and do my best effort to support th
 
 <small>No paypal.me? Send funds via PayPal to jneilliii&#64;gmail&#46;com</small>
 
+
+
+## Tapo P110 firmware using TPAP
+
+An optional Tapo TPAP backend supports P110 firmware that python-kasa does not
+yet handle. Normal Kasa and supported Tapo devices continue to use python-kasa.
+The backend adds private account settings and sidebar On/Off controls, including
+for devices without energy readings. Python 3.11 or newer is required.
+
+See [protocol selection, credentials, migration and validation](docs/TAPO.md).

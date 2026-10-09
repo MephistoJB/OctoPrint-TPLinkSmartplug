@@ -36,7 +36,7 @@
 	<div class="span6">
 		<div class="row-fluid">
 			<div class="control-group">
-				<label class="control-label">{{ _('Username') }}</label>
+				<label class="control-label">{{ _('Default TP-Link account email (optional)') }}</label>
 				<div class="controls">
 					<input type="text" class="input input-block-level" title="{{ _('Tapo/newer devices may require username and password.') }}" data-toggle="tooltip" data-bind="value: settings.settings.plugins.tplinksmartplug.username, tooltip: {}" />
 				</div>
@@ -124,6 +124,8 @@
 				<label class="control-label">{{ _('Password') }}</label>
 				<div class="controls">
 					<input type="password" class="input input-block-level" title="{{ _('Tapo/newer devices may require username and password.') }}" data-toggle="tooltip" data-bind="value: settings.settings.plugins.tplinksmartplug.password, tooltip: {}" />
+                    <p data-bind="visible: settings.settings.plugins.tplinksmartplug.passwordSet">{{ _('Password saved. Leave empty to keep it unchanged.') }}</p>
+                    <label class="checkbox"><input type="checkbox" data-bind="checked: settings.settings.plugins.tplinksmartplug.clearDefaultCredentials" /> {{ _('Remove default account credentials') }}</label>
 				</div>
 			</div>
 		</div>
@@ -236,6 +238,35 @@
 	</div>
 	<div class="modal-body">
 		<table class="table table-condensed">
+            <tr>
+                <td colspan="3"><label>{{ _('Device type') }}</label>
+                    <select data-bind="value: backend">
+                        <option value="kasa">{{ _('python-kasa (Kasa and supported Tapo)') }}</option>
+                        <option value="tapo">{{ _('Tapo P110 TPAP') }}</option>
+                    </select>
+                </td>
+            </tr>
+            <tr data-bind="visible: $root.loginState.isAdmin()">
+                <td colspan="3">
+                    <label>{{ _('TP-Link account email (optional for legacy Kasa)') }}</label>
+                    <input type="email" class="input-block-level" autocomplete="username" data-bind="textInput: tapoUsername, enable: !tapoClearCredentials()" />
+                    <label>{{ _('Tapo password') }}</label>
+                    <input type="password" class="input-block-level" autocomplete="new-password" data-bind="textInput: tapoPassword, enable: !tapoClearCredentials()" />
+                    <p data-bind="visible: tapoPasswordSet">{{ _('Password saved. Leave the password field empty to keep it unchanged.') }}</p>
+                    <p>{{ _('A new password is stored on the OctoPrint host and is never returned to the browser. Changing the account email requires entering its password again.') }}</p>
+                    <label class="checkbox"><input type="checkbox" data-bind="checked: tapoClearCredentials" /> {{ _('Remove stored account credentials (use environment settings instead)') }}</label>
+                    <details>
+                        <summary>{{ _('Advanced: account from environment variables') }}</summary>
+                        <p>{{ _('Used only when no account is stored above. Enter variable names, not credential values.') }}</p>
+                        <label>{{ _('Account email variable') }}</label>
+                        <input type="text" class="input-block-level" autocomplete="off" data-bind="textInput: tapoUsernameEnv" />
+                        <label>{{ _('Password variable') }}</label>
+                        <input type="text" class="input-block-level" autocomplete="off" data-bind="textInput: tapoPasswordEnv" />
+                    </details>
+                    <p>{{ _('TPAP uses the additional P110 transport. Energy charts are unavailable for this transport. Device countdown timers were removed in 2.0.') }}</p>
+                </td>
+            </tr>
+            <tr data-bind="visible: useCountdownRules"><td colspan="3"><label class="checkbox"><input type="checkbox" data-bind="checked: useCountdownRules" /> {{ _('Old device countdown timer setting: uncheck to allow immediate switching in 2.0') }}</label></td></tr>
 			<tr>
                 <td><div class="control-group" data-bind="css: {error: ip().match(/^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/[1-6])?$/) == null}"><div class="controls"><label class="control-label">{{ _('IP') }}</label><input type="text" class="input-block-level" title="{{ _('IP address of plug on network. For multiple plug devices append /1, /2, /# that corresponds to the Plug # label on the device or in the Kasa app.') }}" data-toggle="tooltip" data-bind="textInput: ip, tooltip: {container: '#TPLinkPlugEditor'}" /></div></div></td>
 				<td><div class="controls"><label class="control-label">{{ _('Icon') }}</label><input type="text" class="input-block-level" title="{{ _('Icon to use for button in navbar.') }}" data-toggle="tooltip" data-bind="value: icon, iconpicker: icon,iconpickerOptions: {hideOnSelect: true, collision: true}, tooltip: {container: '#TPLinkPlugEditor'}" /></div></td>

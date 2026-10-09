@@ -2,13 +2,15 @@
 from __future__ import absolute_import
 
 import json
+import asyncio
+import copy
 import logging
 import os
 import re
 import sqlite3
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
 import flask
@@ -89,6 +91,8 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 
 	def __init__(self):
 		self.loaded = None
+		self._tapo_transport = None
+		self._tapo_transport_lock = threading.Lock()
 		self._storage_interface = None
 		self.idleTimeoutWaitTemp = None
 		self._idleIgnoreCommandsArray = None
@@ -183,7 +187,7 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 		self.abortTimeout = self._settings.get_int(["abortTimeout"])
 		self._tplinksmartplug_logger.debug(f"abortTimeout: {self.abortTimeout}")
 
-		self.powerOffWhenIdle = any(map(lambda plug_check: plug_check["automaticShutdownEnabled"] is True, self._settings.get(["arrSmartplugs"])))
+		self.powerOffWhenIdle = any(map(lambda plug_check: plug_check.get("automaticShutdownEnabled", False) is True, self._settings.get(["arrSmartplugs"])))
 		self._tplinksmartplug_logger.debug(f"powerOffWhenIdle: {self.powerOffWhenIdle}")
 
 		self.idleTimeout = self._settings.get_int(["idleTimeout"])
@@ -193,7 +197,7 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 		self._tplinksmartplug_logger.debug(f"idleIgnoreCommands: {self.idleIgnoreCommands}")
 		self.idleTimeoutWaitTemp = self._settings.get_int(["idleTimeoutWaitTemp"])
 		self._tplinksmartplug_logger.debug(f"idleTimeoutWaitTemp: {self.idleTimeoutWaitTemp}")
-		if any(map(lambda plug_check: plug_check["event_on_startup"] is True, self._settings.get(["arrSmartplugs"]))):
+		if any(map(lambda plug_check: plug_check.get("event_on_startup", False) is True, self._settings.get(["arrSmartplugs"]))):
 			self._tplinksmartplug_logger.debug("powering on due to startup.")
 			for plug in self._settings.get(['arrSmartplugs']):
 				if plug["event_on_startup"] is True:
@@ -210,6 +214,8 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 
 	def on_shutdown(self):
 		self.worker.shutdown()
+		if self._tapo_transport is not None:
+			self._tapo_transport.close()
 
 	def on_connect(self, *args, **kwargs):  # Power up on connect
 		if not hasattr(self, 'loaded'):
@@ -230,22 +236,50 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 	# ~~ SettingsPlugin mixin
 
 	def get_settings_defaults(self):
-		return {'debug_logging': False, 'arrSmartplugs': [], 'pollingInterval': 15, 'pollingEnabled': False,
+		return {'tapoCredentials': {}, 'event_on_startup_monitoring': False, 'event_on_upload_monitoring': False,
+				'event_on_error_monitoring': False, 'event_on_disconnect_monitoring': False, 'event_on_shutdown_monitoring': False, 'debug_logging': False, 'arrSmartplugs': [], 'pollingInterval': 15, 'pollingEnabled': False,
 				'thermal_runaway_monitoring': False, 'thermal_runaway_max_bed': 0, 'thermal_runaway_max_extruder': 0,
 				'cost_rate': 0, 'abortTimeout': 30, 'powerOffWhenIdle': False, 'idleTimeout': 30, 'idleIgnoreCommands': 'M105',
 				'idleIgnoreHeaters': '', 'idleTimeoutWaitTemp': 50, 'idleBypassDisconnected': False, 'progress_polling': False, 'useDropDown': False,
 				'device_configs': {}, 'connect_on_connect_request': False, 'username': '', 'password': ''}
 
+	def get_settings_restricted_paths(self):
+		return {"never": [["tapoCredentials"], ["device_configs"], ["password"]]}
+
+	def on_settings_load(self):
+		from .tapo_credentials import public_plugs
+		data = octoprint.plugin.SettingsPlugin.on_settings_load(self)
+		data.pop("tapoCredentials", None)
+		data.pop("device_configs", None)
+		data["password"] = ""
+		data["passwordSet"] = bool(self._settings.get(["password"])) if Permissions.ADMIN.can() else False
+		data["clearDefaultCredentials"] = False
+		if not Permissions.ADMIN.can():
+			data["username"] = ""
+		data["arrSmartplugs"] = public_plugs(data.get("arrSmartplugs", []),
+			self._settings.get(["tapoCredentials"]) or {}, Permissions.ADMIN.can())
+		return data
+
 	def on_settings_save(self, data):
+		from .tapo_credentials import prepare_settings, prepare_default_account
+		data, credentials = prepare_settings(data, self._settings.get(["arrSmartplugs"]) or [],
+			self._settings.get(["tapoCredentials"]) or {}, Permissions.ADMIN.can())
+		data = prepare_default_account(data, self._settings.get(["username"]) or "",
+			self._settings.get(["password"]) or "", Permissions.ADMIN.can())
+		data.pop("device_configs", None)
+
 		old_debug_logging = self._settings.get_boolean(["debug_logging"])
 		old_polling_value = self._settings.get_boolean(["pollingEnabled"])
 		old_polling_timer = self._settings.get(["pollingInterval"])
 		old_power_off_when_idle = self._settings.get_boolean(["powerOffWhenIdle"])
 
 		octoprint.plugin.SettingsPlugin.on_settings_save(self, data)
+		self._settings.set(["tapoCredentials"], credentials)
+		if self._tapo_transport is not None:
+			self._tapo_transport.reset_authentication()
 
 		self.abortTimeout = self._settings.get_int(["abortTimeout"])
-		self.powerOffWhenIdle = any(map(lambda plug_check: plug_check["automaticShutdownEnabled"] is True, self._settings.get(["arrSmartplugs"])))
+		self.powerOffWhenIdle = any(map(lambda plug_check: plug_check.get("automaticShutdownEnabled", False) is True, self._settings.get(["arrSmartplugs"])))
 
 		self.idleTimeout = self._settings.get_int(["idleTimeout"])
 		self.idleIgnoreCommands = self._settings.get(["idleIgnoreCommands"])
@@ -281,9 +315,10 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 				self.poll_status.start()
 
 	def get_settings_version(self):
-		return 18
+		return 19
 
 	def on_settings_migrate(self, target, current=None):
+		legacy_base = any("connect_on_connect" not in p for p in self._settings.get(["arrSmartplugs"]) or [])
 		if current is None or current < 5:
 			# Reset plug settings to defaults.
 			self._tplinksmartplug_logger.debug("Resetting arrSmartplugs for tplinksmartplug settings.")
@@ -383,7 +418,7 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 				arr_smartplugs_new.append(plug)
 				# attempt to get device_config
 				if plug["ip"] != "":
-					device_config = self.get_device_config(plug["ip"])
+					device_config = (self._settings.get(["device_configs"]) or {}).get(plug["ip"])
 					if device_config:
 						device_configs[plug["ip"]] = device_config
 			self._settings.set(["device_configs"], device_configs)
@@ -395,6 +430,17 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 				plug["receives_led_commands"] = False
 				arr_smartplugs_new.append(plug)
 			self._settings.set(["arrSmartplugs"], arr_smartplugs_new)
+
+		if current is None or current < 19:
+			from .migration import migrate_v2_settings
+			data = {key: self._settings.get([key]) for key in
+				("arrSmartplugs", "tapoCredentials", "device_configs", "username", "password", "powerOffWhenIdle")}
+			if legacy_base:
+				for event in ("startup", "upload", "error", "disconnect", "shutdown"):
+					data["event_on_" + event + "_monitoring"] = self._settings.get(["event_on_" + event + "_monitoring"])
+			data = migrate_v2_settings(data, legacy_base)
+			for key in ("arrSmartplugs", "tapoCredentials", "device_configs"):
+				self._settings.set([key], data[key])
 
 	# ~~ AssetPlugin mixin
 
@@ -448,30 +494,25 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 
 	# ~~ SimpleApiPlugin mixin
 
-	async def turn_on_device(self, plug_device) -> Optional[Device]:
-		try:
-			await plug_device.turn_on()
-			await plug_device.update()
-			return plug_device
-		except Exception as e:
-			self._tplinksmartplug_logger.error(f"Failed to turn on {plug_device}: {e}")
-		return None
+	async def turn_on_device(self, plug_device):
+		await plug_device.turn_on()
+		await plug_device.update()
+		return plug_device
 
-	async def turn_off_device(self, plug_device) -> Optional[Device]:
-		try:
-			await plug_device.turn_off()
-			await plug_device.update()
-			return plug_device
-		except Exception as e:
-			self._tplinksmartplug_logger.error(f"Failed to turn on {plug_device}: {e}")
-		return None
+	async def turn_off_device(self, plug_device):
+		await plug_device.turn_off()
+		await plug_device.update()
+		return plug_device
 
 	def turn_on(self, plugip):
+		plug = self.plug_search(self._settings.get(["arrSmartplugs"]), "ip", plugip)
+		if plug and plug.get("useCountdownRules"):
+			from .tapo_transport import TapoError
+			return self._device_error(plugip, TapoError("Device countdown timers were removed in 2.0. Disable the old timer setting explicitly before switching."))
 		self._tplinksmartplug_logger.debug(f"Turning on {plugip}.")
 		try:
 			plug_device = self.get_device(plugip)
-			future = self.worker.run_coroutine_threadsafe(self.turn_on_device(plug_device))
-			plug_device = future.result()
+			plug_device = self._run_device_task(self.turn_on_device(plug_device))
 			self._tplinksmartplug_logger.debug(f"Turn on result: {plug_device.is_on}.")
 			if plug_device and plug_device.is_on:
 				plug = self.plug_search(self._settings.get(["arrSmartplugs"]), "ip", plugip)
@@ -495,13 +536,18 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 					self._waitForHeaters = False
 					self._reset_idle_timer()
 		except Exception as e:
-			self._tplinksmartplug_logger.error(f"Failed to turn on {plugip}: {e}")
+			return self._device_error(plugip, e)
 
 		return self.check_status(plugip)
 
 	def turn_off(self, plugip):
+		plug = self.plug_search(self._settings.get(["arrSmartplugs"]), "ip", plugip)
+		if plug and plug.get("useCountdownRules"):
+			from .tapo_transport import TapoError
+			return self._device_error(plugip, TapoError("Device countdown timers were removed in 2.0. Disable the old timer setting explicitly before switching."))
 		self._tplinksmartplug_logger.debug(f"Turning off {plugip}")
 		try:
+			plug_device = self.get_device(plugip)
 			plug = self.plug_search(self._settings.get(["arrSmartplugs"]), "ip", plugip)
 			self._tplinksmartplug_logger.debug(plug)
 			if plug["gcodeCmdOff"] and plug["gcodeRunCmdOff"] != "":
@@ -515,13 +561,11 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 				self._printer.disconnect()
 				time.sleep(int(plug["autoDisconnectDelay"]))
 
-			plug_device = self.get_device(plugip)
-			future = self.worker.run_coroutine_threadsafe(self.turn_off_device(plug_device))
-			plug_device = future.result()
+			plug_device = self._run_device_task(self.turn_off_device(plug_device))
 			self._tplinksmartplug_logger.debug(f"Turn off result: {plug_device.is_on}.")
 
 		except Exception as e:
-			self._tplinksmartplug_logger.error(f"Failed to turn on {plugip}: {e}")
+			return self._device_error(plugip, e)
 
 		return self.check_status(plugip)
 
@@ -535,7 +579,10 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 		emeter_data = None
 		today = datetime.today()
 		if plugip != "":
-			plug_device = self.get_device(plugip)
+			try:
+				plug_device = self.get_device(plugip)
+			except Exception as error:
+				return self._device_error(plugip, error)
 
 			if plug_device:
 				self._tplinksmartplug_logger.debug(plug_device.state_information)
@@ -636,11 +683,11 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 			if "start_date" in data and data["start_date"] != "":
 				start_date = data["start_date"]
 			else:
-				start_date = datetime.date.today() - timedelta(days=1)
+				start_date = datetime.today().date() - timedelta(days=1)
 			if "end_date" in data and data["end_date"] != "":
 				end_date = data["end_date"]
 			else:
-				end_date = datetime.date.today() + timedelta(days=1)
+				end_date = datetime.today().date() + timedelta(days=1)
 			cursor = db.cursor()
 			cursor.execute(
 				'''SELECT timestamp, current, power, grandtotal, voltage FROM energy_data WHERE ip=? AND timestamp BETWEEN ? AND ? ORDER BY timestamp DESC''',
@@ -668,16 +715,23 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 			self._tplinksmartplug_logger.debug("Restarting idle timer.")
 			self._reset_idle_timer()
 		elif command == "getListPlug":
-			return json.dumps(self._settings.get(["arrSmartplugs"]))
+			from .tapo_credentials import public_plugs
+			return json.dumps(public_plugs(self._settings.get(["arrSmartplugs"]), {}))
 		elif command == "discoverDevices":
-			username = None
-			password = None
+			username = self._settings.get(["username"]) or None
+			password = self._settings.get(["password"]) or None
+			if not Permissions.ADMIN.can():
+				return flask.make_response("Only administrators can discover devices with account credentials", 403)
 			if "username" in data and data["username"] != "":
 				username = data["username"]
 			if "password" in data and data["password"] != "":
 				password = data["password"]
-			found_devices_task = self.worker.run_coroutine_threadsafe(self.discover_devices(username, password))
-			found_devices = found_devices_task.result()
+			try:
+				found_devices = self._run_device_task(self.discover_devices(username, password))
+			except Exception:
+				message = "Device discovery failed. Check network reachability and account settings."
+				self._tplinksmartplug_logger.warning(message)
+				return flask.make_response(flask.jsonify(error=message, discovered_devices={}), 502)
 			response = {'discovered_devices': found_devices}
 		else:
 			response = dict(ip="{ip}".format(**data), currentState="unknown")
@@ -697,7 +751,7 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 
 	def on_event(self, event, payload):
 		# Startup Event
-		if event == Events.STARTUP and any(map(lambda plug_check: plug_check["event_on_startup"] is True, self._settings.get(["arrSmartplugs"]))) is True:
+		if event == Events.STARTUP and any(map(lambda plug_check: plug_check.get("event_on_startup", False) is True, self._settings.get(["arrSmartplugs"]))) is True:
 			self._tplinksmartplug_logger.debug(f"powering on due to {event} event.")
 			for plug in self._settings.get(['arrSmartplugs']):
 				if plug["event_on_startup"] is True:
@@ -706,7 +760,7 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 					if response["currentState"] == "on":
 						self._plugin_manager.send_plugin_message(self._identifier, response)
 		# Error Event
-		if event == Events.ERROR and any(map(lambda plug_check: plug_check["event_on_error"] is True, self._settings.get(["arrSmartplugs"]))) is True:
+		if event == Events.ERROR and any(map(lambda plug_check: plug_check.get("event_on_error", False) is True, self._settings.get(["arrSmartplugs"]))) is True:
 			self._tplinksmartplug_logger.debug(f"powering off due to {event} event.")
 			for plug in self._settings.get(['arrSmartplugs']):
 				if plug["event_on_error"] is True:
@@ -716,7 +770,7 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 						self._plugin_manager.send_plugin_message(self._identifier, response)
 		# Client Opened Event
 		if event == Events.CLIENT_OPENED:
-			if any(map(lambda plug_check: plug_check["automaticShutdownEnabled"] is True, self._settings.get(["arrSmartplugs"]))):
+			if any(map(lambda plug_check: plug_check.get("automaticShutdownEnabled", False) is True, self._settings.get(["arrSmartplugs"]))):
 				self._tplinksmartplug_logger.debug(f"resetting idle timer due to {event} event.")
 				self._reset_idle_timer()
 			self._plugin_manager.send_plugin_message(self._identifier,
@@ -807,7 +861,7 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 				self._printer.select_file(self._autostart_file, False, printAfterSelect=True)
 				self._autostart_file = None
 		# File Uploaded Event
-		if event == Events.UPLOAD and any(map(lambda plug_check: plug_check["event_on_upload"] is True, self._settings.get(["arrSmartplugs"]))) is True:
+		if event == Events.UPLOAD and any(map(lambda plug_check: plug_check.get("event_on_upload", False) is True, self._settings.get(["arrSmartplugs"]))) is True:
 			self._tplinksmartplug_logger.debug(f"File uploaded: {payload.get('name', '')}. Turning enabled plugs on.")
 			self._tplinksmartplug_logger.debug(payload)
 			for plug in self._settings.get(['arrSmartplugs']):
@@ -821,7 +875,7 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 						if payload.get("path", False) and payload.get("target") == "local" and payload.get("print", False):
 							self._autostart_file = payload.get("path")
 		# Shutdown Event
-		if event == Events.SHUTDOWN and any(map(lambda plug_check: plug_check["event_on_shutdown"] is True, self._settings.get(["arrSmartplugs"]))) is True:
+		if event == Events.SHUTDOWN and any(map(lambda plug_check: plug_check.get("event_on_shutdown", False) is True, self._settings.get(["arrSmartplugs"]))) is True:
 			for plug in self._settings.get(['arrSmartplugs']):
 				if plug["event_on_shutdown"] is True:
 					self._tplinksmartplug_logger.debug(f"powering off {plug['ip']} due to shutdown event.")
@@ -1028,36 +1082,49 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 		return_val["value"] = mx
 		return return_val
 
-	def get_device_config(self, plugip: str):
-		device_configs = self._settings.get(["device_configs"])
-		config_dict = device_configs.get(plugip, None)
-		username = self._settings.get(["username"])
-		password = self._settings.get(["password"])
+	def _account_for_plug(self, plug):
+		accounts = self._settings.get(["tapoCredentials"]) or {}
+		account = accounts.get((plug or {}).get("tapoCredentialId"))
+		if account is not None:
+			return account
+		username, password = self._settings.get(["username"]), self._settings.get(["password"])
+		return {"username": username, "password": password} if username or password else None
 
-		if not config_dict:  # config is not saved, add it to settings
-			try:
-				plug_ip = plugip.split("/")
-				future = self.worker.run_coroutine_threadsafe(
-					Discover.discover_single(plug_ip[0], username=username, password=password))
-				device = future.result()
-				config_dict = device.config.to_dict()
-				if config_dict:
-					if "credentials" in config_dict:  # remove credentials from config to avoid yaml save error
-						config_dict["credentials"] = {"username": username, "password": password}
-					device_configs[plugip] = config_dict
-					self._settings.set(["device_configs"], device_configs)
-					self._settings.save()
-			except Exception as e:
-				self._tplinksmartplug_logger.debug(f"Unable to get device_config for {plugip}: {e}")
-		return config_dict
+	def _run_device_task(self, coroutine):
+		async def bounded():
+			return await asyncio.wait_for(coroutine, 20)
+		future = self.worker.run_coroutine_threadsafe(bounded())
+		try:
+			return future.result(timeout=21)
+		except Exception:
+			future.cancel()
+			raise
+
+	def get_device_config(self, plugip: str):
+		configs = self._settings.get(["device_configs"]) or {}
+		config = copy.deepcopy(configs.get(plugip))
+		plug = self.plug_search(self._settings.get(["arrSmartplugs"]), "ip", plugip)
+		account = self._account_for_plug(plug)
+		if not config:
+			device = self._run_device_task(Discover.discover_single(plugip.split("/")[0],
+				username=(account or {}).get("username"), password=(account or {}).get("password")))
+			config = device.config.to_dict()
+			config.pop("credentials", None)
+			configs[plugip] = config
+			self._settings.set(["device_configs"], configs)
+			self._settings.save()
+		config = copy.deepcopy(config)
+		if account:
+			config.pop("credentials_hash", None)
+			config["credentials"] = account
+		return config
 
 	async def update_device(self, dev):
 		try:
 			await dev.update()
 			self._tplinksmartplug_logger.debug(f"found device {dev.alias} (model: {dev.model})")
 		except Exception as e:
-			self._tplinksmartplug_logger.debug(f"Unable to get device_config for {dev.host}: {e}")
-			self._tplinksmartplug_logger.debug(f"Unable to get device_config for {dev.host}: {e}")
+			self._tplinksmartplug_logger.warning("Could not update a discovered device. Check its account settings and reachability.")
 
 	async def discover_devices(self, username=None, password=None):
 		devices_mac = {}
@@ -1067,16 +1134,11 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 		return devices_mac
 
 	async def connect_device(self, config_dict):
-		try:
-			if "credentials" in config_dict and is_version_compatible(kasa_version, "<0.8.0"):
-				config_dict["credentials"] = Credentials(**config_dict["credentials"])
-			self._tplinksmartplug_logger.debug(config_dict)
-			device = await Device.connect(config=Device.Config.from_dict(config_dict))
-			await device.update()
-			return device
-		except Exception as e:
-			self._tplinksmartplug_logger.error(f"Error connecting to device: {e}")
-		return None
+		if "credentials" in config_dict and is_version_compatible(kasa_version, "<0.8.0"):
+			config_dict["credentials"] = Credentials(**config_dict["credentials"])
+		device = await Device.connect(config=Device.Config.from_dict(config_dict))
+		await device.update()
+		return device
 
 	async def set_device_led(self, device, led_values, set_color=False) -> Optional[Device]:
 		try:
@@ -1097,21 +1159,36 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 					await light.set_brightness(int(led_values["LEDBrightness"]))
 				await device.update()
 		except Exception as e:
-			self._tplinksmartplug_logger.error(f"Error connecting to device: {e}")
+			self._tplinksmartplug_logger.warning("Light update failed. Check the selected device and account settings.")
 		return device
 
-	def get_device(self, plugip: str) -> Optional[Device]:
-		try:
-			config_dict = self.get_device_config(plugip)
-			future = self.worker.run_coroutine_threadsafe(self.connect_device(config_dict))
-			device = future.result()
-			plug_ip = plugip.split("/")
-			if len(plug_ip) == 2 and len(device.children) > 0:
-				device = device.children[int(plug_ip[1]) - 1]
+	def get_device(self, plugip: str):
+		plug = self.plug_search(self._settings.get(["arrSmartplugs"]), "ip", plugip)
+		if plug is None:
+			raise ValueError("The requested plug is not configured.")
+		backend = plug.get("backend", "kasa")
+		if backend == "tapo":
+			from .tapo_device import TapoDevice
+			from .tapo_transport import TapoTransport
+			with self._tapo_transport_lock:
+				if self._tapo_transport is None:
+					self._tapo_transport = TapoTransport()
+			device = TapoDevice(self._tapo_transport, plug, self._account_for_plug(plug))
+			self._run_device_task(device.update())
 			return device
-		except Exception as e:
-			self._tplinksmartplug_logger.error(f"Error connecting to device: {e}")
-		return None
+		if backend != "kasa":
+			raise ValueError("Unknown plug backend. Select python-kasa or Tapo TPAP.")
+		device = self._run_device_task(self.connect_device(self.get_device_config(plugip)))
+		parts = plugip.split("/")
+		if len(parts) == 2 and len(device.children) > 0:
+			device = device.children[int(parts[1]) - 1]
+		return device
+
+	def _device_error(self, plugip, error):
+		from .tapo_transport import TapoError
+		message = str(error) if isinstance(error, TapoError) else "Plug communication failed. Check the device type, reachability and account settings. The command was not retried by the plugin."
+		self._tplinksmartplug_logger.warning("Plug request failed for %s: %s", plugip, message)
+		return dict(ip=plugip, currentState="unknown", emeter=None, error=message)
 
 	def deep_get(self, d, keys, default=None):
 		"""
@@ -1191,7 +1268,7 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 				t.daemon = True
 				t.start()
 			return
-		elif gcode in ["M150", "M355"] and any(map(lambda plug_check: plug_check["receives_led_commands"] is True, self._settings.get(["arrSmartplugs"]))):
+		elif gcode in ["M150", "M355"] and any(map(lambda plug_check: plug_check.get("receives_led_commands", False) is True, self._settings.get(["arrSmartplugs"]))):
 			for led_device in self._settings.get(["arrSmartplugs"]):
 				if led_device["receives_led_commands"]:
 					device = self.get_device(led_device["ip"])
@@ -1336,7 +1413,7 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 
 
 __plugin_name__ = "TP-Link Smartplug"
-__plugin_pythoncompat__ = ">=2.7,<4"
+__plugin_pythoncompat__ = ">=3.11,<4"
 
 
 def __plugin_load__():

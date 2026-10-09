@@ -1,35 +1,41 @@
-import threading
-import logging
+"""Thread-owned asyncio loop for the upstream 2.0 device operations."""
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
-
-
-logger = logging.getLogger("octoprint.plugins.octoprint_nanny.worker")
+import threading
 
 
 class AsyncTaskWorker:
     def __init__(self):
-        self._thread = threading.Thread(
-            target=self.run,
-            name=str(self.__class__),
-        )
-        self._thread.daemon = True
-        logger.info(f"Starting thread {self._thread.name}")
+        self._ready = threading.Event()
+        self._closed = False
+        self._thread = threading.Thread(target=self.run, name="tplink-device-worker", daemon=True)
         self._thread.start()
+        self._ready.wait()
 
     def run(self):
         self.loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.loop)
-        self.loop.set_default_executor(
-            ThreadPoolExecutor(thread_name_prefix="PrintNanny")
-        )
-        self.loop.run_forever()
+        self._ready.set()
+        try:
+            self.loop.run_forever()
+        finally:
+            pending = asyncio.all_tasks(self.loop)
+            for task in pending:
+                task.cancel()
+            if pending:
+                self.loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            self.loop.run_until_complete(self.loop.shutdown_asyncgens())
+            self.loop.run_until_complete(self.loop.shutdown_default_executor())
+            self.loop.close()
 
     def shutdown(self, **kwargs):
-        logger.warning("shutdown initiated")
-        self.loop.stop()
-        self.loop.close()
+        if self._closed:
+            return
+        self._closed = True
+        self.loop.call_soon_threadsafe(self.loop.stop)
         self._thread.join()
 
     def run_coroutine_threadsafe(self, coro):
+        if self._closed:
+            coro.close()
+            raise RuntimeError("The device worker has stopped.")
         return asyncio.run_coroutine_threadsafe(coro, self.loop)

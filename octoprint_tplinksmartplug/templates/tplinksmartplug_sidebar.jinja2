@@ -1,3 +1,13 @@
+<div class="tplinksmartplug-controls" data-bind="foreach: arrSmartplugs">
+    <div class="well well-small">
+        <strong data-bind="text: label"></strong>
+        <p class="muted" data-bind="text: $root.plugStateText($data)" aria-live="polite"></p>
+        <div class="btn-group">
+            <button type="button" class="btn btn-small tplinksmartplug-on" data-bind="click: $root.sidebarTurnOn, enable: $root.canControlPlug($data) && currentState() !== 'on'">{{ _('On') }}</button>
+            <button type="button" class="btn btn-small tplinksmartplug-off" data-bind="click: $root.sidebarTurnOff, enable: $root.canControlPlug($data) && currentState() !== 'off'">{{ _('Off') }}</button>
+        </div>
+    </div>
+</div>
 <!-- ko if: show_sidebar -->
 <div id="tplinksmartplugs" class="row-fluid" data-bind="foreach: filteredSmartplugs">
 	<div data-bind="with: value">

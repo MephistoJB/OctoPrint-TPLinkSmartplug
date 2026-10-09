@@ -7,3 +7,6 @@ dist
 *.egg*
 .DS_Store
 *.zip
+__pycache__/
+.pytest_cache/
+.venv/
