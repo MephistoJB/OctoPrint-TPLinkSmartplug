@@ -114,6 +114,9 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 		self._autostart_file = None
 		self.db_path = None
 		self.poll_status = None
+		from .auto_connect import AutoConnect
+		self._auto_connect = AutoConnect(self)
+		self._auto_connect_timer = None
 		self.power_off_queue = []
 		self._gcode_queued = False
 		self.active_timers = {"on": {}, "off": {}}
@@ -209,10 +212,14 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 						self._tplinksmartplug_logger.debug(f"powering on {plug['ip']} during startup failed.")
 		self._reset_idle_timer()
 		self.loaded = True
+		self._configure_auto_connect()
 
 	# ~~ ShutdownPlugin mixin
 
 	def on_shutdown(self):
+		if self._auto_connect_timer is not None:
+			self._auto_connect_timer.cancel()
+		self._auto_connect.clear()
 		self.worker.shutdown()
 		if self._tapo_transport is not None:
 			self._tapo_transport.close()
@@ -313,6 +320,17 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 			if new_polling_value:
 				self.poll_status = RepeatedTimer(int(self._settings.get(["pollingInterval"])) * 60, self.check_statuses)
 				self.poll_status.start()
+		self._configure_auto_connect()
+
+	def _configure_auto_connect(self):
+		if self._auto_connect_timer is not None:
+			self._auto_connect_timer.cancel()
+			self._auto_connect_timer = None
+		if any(p.get("autoConnect") for p in self._settings.get(["arrSmartplugs"]) or []):
+			self._auto_connect_timer = RepeatedTimer(5, self._auto_connect.tick)
+			self._auto_connect_timer.start()
+		else:
+			self._auto_connect.clear()
 
 	def get_settings_version(self):
 		return 19
@@ -517,10 +535,7 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 			if plug_device and plug_device.is_on:
 				plug = self.plug_search(self._settings.get(["arrSmartplugs"]), "ip", plugip)
 				self._tplinksmartplug_logger.debug(plug)
-				if plug["autoConnect"] and self._printer.is_closed_or_error():
-					c = threading.Timer(int(plug["autoConnectDelay"]), self._printer.connect)
-					c.daemon = True
-					c.start()
+				self._auto_connect.observe(plugip, "on", explicit=True)
 				if plug["gcodeCmdOn"] and self._printer.is_closed_or_error():
 					self._tplinksmartplug_logger.debug("queuing gcode on commands because printer isn't connected yet.")
 					self._gcode_queued = True
@@ -587,6 +602,7 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 			if plug_device:
 				self._tplinksmartplug_logger.debug(plug_device.state_information)
 				chk = plug_device.is_on
+				self._auto_connect.observe(plugip, "on" if chk else "off")
 
 				if plug_device.has_emeter:
 					v = plug_device.state_information.get("Voltage", 0.0)

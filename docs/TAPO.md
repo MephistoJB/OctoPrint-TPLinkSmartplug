@@ -139,3 +139,18 @@ Rollback requires reinstalling the 1.1.0 release **and restoring the pre-migrati
 configuration backup**. The same plugin identifier is used, so versions cannot be
 installed side by side. The original account store is preserved, but converted
 monitor flags and settings-version changes require restoring the backup.
+# Automatic printer connection
+
+Enable the existing **Auto Connect** option for the printer's plug. The plugin
+checks that plug every five seconds, including when regular status polling is
+disabled, and detects power-on via the sidebar, the physical button, or the Tapo
+app. It also handles an already powered plug after OctoPrint starts.
+
+After **Auto Connect Delay**, it waits for the configured serial port (or an
+available port for automatic detection). Failed connections are retried every
+15 seconds, up to six attempts within three minutes after the delay. A stale
+OctoPrint serial error is cleared before reconnecting. A connected or connecting
+printer is left alone. Once connected, manually disconnecting does not trigger
+another connection until the next detected power cycle or explicit plugin
+power-on. Switching the plug off cancels pending attempts.
+
