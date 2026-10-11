@@ -139,7 +139,8 @@ Rollback requires reinstalling the 1.1.0 release **and restoring the pre-migrati
 configuration backup**. The same plugin identifier is used, so versions cannot be
 installed side by side. The original account store is preserved, but converted
 monitor flags and settings-version changes require restoring the backup.
-# Automatic printer connection
+
+## Automatic printer connection
 
 Enable the existing **Auto Connect** option for the printer's plug. The plugin
 checks that plug every five seconds, including when regular status polling is

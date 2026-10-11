@@ -41,6 +41,10 @@ class AutoConnect:
             self.pending.clear()
             self.states.clear()
 
+    def connected(self):
+        with self.lock:
+            self.pending.clear()
+
     def tick(self):
         plugs = self.plugin._settings.get(["arrSmartplugs"]) or []
         enabled = {p["ip"] for p in plugs if p.get("autoConnect")}

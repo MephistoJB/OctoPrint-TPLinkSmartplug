@@ -85,6 +85,17 @@ def test_connected_printer_and_manual_disconnect_are_respected(setup):
     printer.disconnect.assert_not_called()
 
 
+def test_connection_event_prevents_retry_after_immediate_manual_disconnect(setup):
+    _, printer, controller, clock, _ = setup
+    controller.tick()
+    clock.return_value = 10
+    controller.tick()
+    controller.connected()
+    clock.return_value = 25
+    controller.tick()
+    assert printer.connect.call_count == 1
+
+
 def test_retry_limit_and_new_power_cycle(setup):
     plugin, printer, controller, clock, _ = setup
     controller.tick()

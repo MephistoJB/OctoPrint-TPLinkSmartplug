@@ -866,6 +866,7 @@ class tplinksmartplugPlugin(octoprint.plugin.SettingsPlugin,
 			self._timelapse_active = False
 		# Printer Connected Event
 		if event == Events.CONNECTED:
+			self._auto_connect.connected()
 			if self._gcode_queued:
 				for plug in self._settings.get(['arrSmartplugs']):
 					if plug["gcodeCmdOn"] and plug["gcodeRunCmdOn"] != "":
