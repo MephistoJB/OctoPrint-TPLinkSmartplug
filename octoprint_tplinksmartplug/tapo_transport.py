@@ -22,10 +22,13 @@ class TapoTransport:
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="tplink-tapo")
         # Authentication failures stop polling until configuration/credentials change.
         self._blocked = {}
+        self._sessions = {}
 
     def close(self):
         with self._lock:
             self._executor.shutdown(wait=True)
+            self._sessions.clear()
+            self._blocked.clear()
 
     def send(self, command, plug, credentials=None):
         ip = plug.get("ip", "")
@@ -76,15 +79,19 @@ class TapoTransport:
     def reset_authentication(self):
         with self._lock:
             self._blocked.clear()
+            self._sessions.clear()
 
     def _run(self, action, ip, username, password):
         try:
             return asyncio.run(asyncio.wait_for(self._query(action, ip, username, password), self._timeout))
         except TimeoutError:
+            self._sessions.pop(ip, None)
             raise TapoError("Tapo request timed out. The plug state is unknown; the command was not retried.") from None
         except TapoError:
+            self._sessions.pop(ip, None)
             raise
         except Exception as exc:
+            self._sessions.pop(ip, None)
             # Native library errors may contain request details; never log or expose them.
             description = str(exc).upper()
             if any(word in description for word in ("UNAUTHORIZED", "CREDENTIAL", "AUTH", "PASSWORD", "LOGIN", "TPAP_HASH_MISMATCH")):
@@ -99,8 +106,14 @@ class TapoTransport:
             except ImportError:
                 raise TapoError("Tapo support requires Python 3.11 or newer and tapo 0.11.1.") from None
             factory = ApiClient
-        # Fresh sessions avoid stale tokens; there is no replay of a failed write.
-        device = await factory(username, password).p110(ip)
+        # Polling must not create a new authenticated session on every read.
+        # Failed sessions are discarded for the next request, without replaying writes.
+        session = self._sessions.get(ip)
+        if session is None or session[0] != (username, password):
+            device = await factory(username, password).p110(ip)
+            self._sessions[ip] = ((username, password), device)
+        else:
+            device = session[1]
         if action in ("on", "off"):
             await getattr(device, action)()
             return {"system": {"set_relay_state": {"err_code": 0}}}

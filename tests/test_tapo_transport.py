@@ -46,6 +46,29 @@ def test_status_is_read_only(transport, plug, state, relay):
     device.off.assert_not_awaited()
     factory.assert_called_once_with("test@example.invalid", "dummy-password-for-tests")
 
+
+def test_polling_and_switching_reuse_authenticated_session(transport, plug):
+    adapter, device, factory = transport
+    for _ in range(10):
+        adapter.send(STATUS, plug)
+    adapter.send(ON, plug)
+    adapter.send(OFF, plug)
+    assert factory.call_count == 1
+    assert device.get_device_info.await_count == 10
+    device.on.assert_awaited_once()
+    device.off.assert_awaited_once()
+
+
+def test_failed_session_is_discarded_without_replaying_write(transport, plug):
+    adapter, device, factory = transport
+    adapter.send(STATUS, plug)
+    device.off.side_effect = RuntimeError("Socket closed")
+    with pytest.raises(TapoError):
+        adapter.send(OFF, plug)
+    device.off.assert_awaited_once()
+    adapter.send(STATUS, plug)
+    assert factory.call_count == 2
+
 @pytest.mark.parametrize("command,method,other", [(ON, "on", "off"), (OFF, "off", "on")])
 def test_switch_awaits_acknowledgement(transport, plug, command, method, other):
     adapter, device, _ = transport
