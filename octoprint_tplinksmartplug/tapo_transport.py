@@ -109,15 +109,31 @@ class TapoTransport:
         # Polling must not create a new authenticated session on every read.
         # Failed sessions are discarded for the next request, without replaying writes.
         session = self._sessions.get(ip)
+        reused = session is not None and session[0] == (username, password)
         if session is None or session[0] != (username, password):
             device = await factory(username, password).p110(ip)
             self._sessions[ip] = ((username, password), device)
         else:
             device = session[1]
         if action in ("on", "off"):
-            await getattr(device, action)()
+            try:
+                await getattr(device, action)()
+            except Exception:
+                if reused:
+                    raise TapoError("Tapo session failed. Refresh the plug status before retrying; the command was not retried.") from None
+                raise
             return {"system": {"set_relay_state": {"err_code": 0}}}
-        info = (await device.get_device_info()).to_dict()
+        try:
+            response = await device.get_device_info()
+        except Exception:
+            if not reused:
+                raise
+            # Only reads may retry once with a fresh session after token expiry.
+            self._sessions.pop(ip, None)
+            device = await factory(username, password).p110(ip)
+            self._sessions[ip] = ((username, password), device)
+            response = await device.get_device_info()
+        info = response.to_dict()
         state = info.get("device_on")
         if not isinstance(state, bool):
             raise TapoError("Tapo returned no valid relay state.")

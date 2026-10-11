@@ -69,6 +69,16 @@ def test_failed_session_is_discarded_without_replaying_write(transport, plug):
     adapter.send(STATUS, plug)
     assert factory.call_count == 2
 
+
+def test_expired_session_can_refresh_on_read_without_blocking_account(transport, plug):
+    adapter, device, factory = transport
+    info = Mock(to_dict=lambda: {"device_on": True})
+    device.get_device_info.side_effect = [info, RuntimeError("Unauthorized session expired"), info]
+    adapter.send(STATUS, plug)
+    adapter.send(STATUS, plug)
+    assert factory.call_count == 2
+    assert not adapter._blocked
+
 @pytest.mark.parametrize("command,method,other", [(ON, "on", "off"), (OFF, "off", "on")])
 def test_switch_awaits_acknowledgement(transport, plug, command, method, other):
     adapter, device, _ = transport
