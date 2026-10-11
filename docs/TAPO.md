@@ -155,3 +155,17 @@ printer is left alone. Once connected, manually disconnecting does not trigger
 another connection until the next detected power cycle or explicit plugin
 power-on. Switching the plug off cancels pending attempts.
 
+When the plug also powers the printer on at startup, disable OctoPrint's native
+**Auto-connect on server startup** option. The plug's **Auto Connect** remains
+enabled and waits until power and USB are ready. An earlier native connection
+attempt can fail while the printer is off and trigger **Off on Error**.
+
+Tapo monitoring reuses the authenticated device session. A failed cached read
+can establish a fresh session once within the request timeout. Failed switching
+commands are never replayed; refreshing status permits a subsequent explicit
+command to use a new session.
+
+Validated on OctoPi with OctoPrint 1.11.8 and the P110 on 2026-10-11: automatic
+connection after server startup, plugin power-on and independent relay power-on;
+manual disconnect remains closed; explicit plugin power-on rearms connection.
+The Python suite contains 111 passing tests, with frontend checks also passing.
